@@ -20,10 +20,41 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# These libraries are chatty and their handlers must never reach stdout, which
+# carries the JSON-RPC protocol. Set before anything imports the onenote package.
+for _noisy in ("msal", "httpx", "httpcore", "urllib3", "requests"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("job_tracker_mcp")
 
 mcp = FastMCP("job-tracker")
 db = Database()
+
+
+@functools.cache
+def _onenote():
+    """Build the OneNote service on first use, never at import.
+
+    `db = Database()` above runs during module import, before FastMCP is
+    listening. An msal or httpx import that touched the network there would make
+    the server appear crashed to Claude Desktop with no diagnosable output. So
+    the onenote package -- and its network stack -- is imported here, lazily.
+    """
+    from job_tracker_mcp.onenote.service import OneNoteService
+    return OneNoteService(db)
+
+
+def _onenote_guard(fn):
+    """Turn the OneNote failure modes into the error strings the model must read."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from job_tracker_mcp.onenote.auth import AuthError
+        from job_tracker_mcp.onenote.graph import GraphError
+        try:
+            return fn(*args, **kwargs)
+        except (AuthError, GraphError) as exc:
+            return {"error": str(exc)}
+    return wrapper
 
 
 def _tool_guard(fn):
@@ -292,6 +323,178 @@ def search_jobs(
     Returns the same shape as get_jobs.
     """
     return db.search_jobs(query, status, limit, offset)
+
+
+# ---------------------------------------------------------------------------
+# Part 2: OneNote. Tools 16-25.
+#
+# Every one of these degrades to a clean error string when OneNote is
+# unconfigured. None of them can hang, and none is reachable during import.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+@_tool_guard
+def onenote_auth_status() -> dict:
+    """Diagnose the OneNote connection. The first tool to call when anything fails.
+
+    Never triggers interactive sign-in and makes no notebook calls. Returns
+    configured=false (NOT an error) when the Azure app id is unset, with setup
+    instructions in `message`.
+
+    A `reason` of "keychain_timeout" means macOS is showing an approval dialog
+    this process cannot answer -- usually because .venv was rebuilt since the
+    last sign-in. Re-run onenote-auth.sh.
+    """
+    return _onenote().auth_status()
+
+
+@mcp.tool
+@_tool_guard
+@_onenote_guard
+def onenote_list_sections(notebook: str | None = None) -> dict:
+    """Enumerate notebooks and their sections, with full section-group paths.
+
+    One-time discovery: use it to confirm the exact displayName of the section
+    to track, or to find ids when two sections share a name.
+    """
+    return _onenote().list_sections(notebook)
+
+
+@mcp.tool
+@_tool_guard
+@_onenote_guard
+def onenote_sync(full: bool = False, fetch_content: bool = True,
+                 max_pages: int = 200) -> dict:
+    """Refresh the local mirror of the OneNote section. The ONLY tool that needs network.
+
+    Every other OneNote tool reads the local cache, so call this first if you
+    need fresh data. Page content is refetched only when the page changed
+    upstream, which keeps a steady-state sync to a single HTTP request.
+
+    full=true refetches every page's content -- use only after the text
+    extractor itself has changed. fetch_content=false is a fast metadata-only
+    pass. If `truncated` is true, pages exist that were NOT synced.
+    """
+    return _onenote().sync(full=full, fetch_content=fetch_content, max_pages=max_pages)
+
+
+@mcp.tool
+@_tool_guard
+def onenote_list_pages(include_ignored: bool = False, include_deleted: bool = False,
+                       modified_since: str | None = None,
+                       limit: int = 50, offset: int = 0) -> dict:
+    """List cached pages, newest edit first. Reads the mirror; never hits the network.
+
+    Page bodies are NOT included -- a 47-page dump would obliterate your context.
+    Use onenote_get_page for one page's text.
+    """
+    limit = max(1, min(int(limit), 200))
+    return _onenote().store.list_pages(include_ignored, include_deleted,
+                                       modified_since, limit, max(0, int(offset)))
+
+
+@mcp.tool
+@_tool_guard
+def onenote_get_page(page_id: str, format: str = "text",
+                     max_chars: int = 20000, offset: int = 0) -> dict:
+    """Read one cached page as plain text (or raw html, rarely wanted).
+
+    Long pages are paged: when `truncated` is true, call again with
+    offset=next_offset. `stale` means the cached text predates the page's most
+    recent edit -- run onenote_sync.
+
+    This is the tool for Tier-B extraction: read an unparsed page, understand the
+    application records in it, then call onenote_link_page with the date.
+    """
+    return _onenote().get_page(page_id, format, max_chars, offset)
+
+
+@mcp.tool
+@_tool_guard
+def onenote_search_pages(query: str, limit: int = 20, offset: int = 0) -> dict:
+    """Case-insensitive substring search over cached page titles and text.
+
+    Returns matched lines as snippets, not whole pages. Wildcards are escaped.
+    """
+    if not query or not query.strip():
+        return {"error": "query must not be empty"}
+    limit = max(1, min(int(limit), 200))
+    return _onenote().store.search_pages(query, limit, max(0, int(offset)))
+
+
+@mcp.tool
+@_tool_guard
+@_onenote_guard
+def onenote_create_page(title: str, body_lines: list[str],
+                        job_id: str | None = None, confirm: bool = False) -> dict:
+    """Create a page in the OneNote section. The ONLY tool that writes to OneNote.
+
+    Gated behind JOB_TRACKER_ONENOTE_WRITE=1, and a DRY RUN by default: call once
+    with confirm=false to show the user the preview, then again with confirm=true
+    only after they agree. Page creation cannot be undone through this server --
+    there is no delete tool, by design.
+
+    Passing job_id stamps a visible `job-tracker-id:` marker into the page, which
+    is what makes this idempotent: a second call for the same job returns
+    result="exists" and creates nothing.
+    """
+    return _onenote().create_page(title, body_lines, job_id, confirm)
+
+
+@mcp.tool
+@_tool_guard
+def onenote_link_page(page_id: str, job_id: str, unlink: bool = False,
+                      evidence: str | None = None, date_applied: str | None = None,
+                      extracted: dict | None = None) -> dict:
+    """Assert that a page documents a job, when automatic matching could not.
+
+    This is the second half of Tier-B extraction, and the loop that resolves
+    `ambiguous` entries. A manual link outranks everything and is never
+    overwritten by a later reconciliation.
+
+    PASS `date_applied` (ISO YYYY-MM-DD) whenever the page states when you
+    applied. Without it, reconciliation has no date to record and would use
+    today's -- permanently misdating an application you made months ago.
+
+    unlink=true removes a wrong match. It is refused for pages this server
+    created; delete those in OneNote first.
+    """
+    return _onenote().link_page(page_id, job_id, unlink, evidence, date_applied, extracted)
+
+
+@mcp.tool
+@_tool_guard
+def onenote_ignore_page(page_id: str, ignore: bool = True) -> dict:
+    """Mark a page as not-an-application, so reconciliation stops reporting it.
+
+    A "Job Searching" section holds resume drafts, interview prep, and recruiter
+    lists as well as applications. Without this, every report carries the same
+    permanent noise and the user learns to skim past all of it.
+    """
+    return _onenote().ignore_page(page_id, ignore)
+
+
+@mcp.tool
+@_tool_guard
+def reconcile_applications(dry_run: bool = True, min_confidence: float = 0.6,
+                           apply_marks: bool = False, limit: int = 100) -> dict:
+    """Cross-reference tracked jobs against the OneNote mirror. The point of Part 2.
+
+    Reads the local cache; run onenote_sync first for fresh data. Reports:
+      matched       -- both sources agree
+      onenote_only  -- the page says applied, the database does not
+      db_only       -- the database says applied, no page documents it
+      ambiguous     -- several jobs plausibly match; a human must pick
+      unmatched     -- a page names a company the tracker has never seen
+      unparsed_pages-- read them with onenote_get_page, then onenote_link_page
+
+    MUTATION IS OPT-IN TWICE: pass BOTH dry_run=false AND apply_marks=true to
+    call mark_applied for onenote_only entries. Ambiguous entries are never acted
+    on. db_only is never acted on -- creating pages in bulk is irreversible.
+    Status transitions are still enforced: a rejected job lands in `skipped`.
+    """
+    return _onenote().reconcile(dry_run, min_confidence, apply_marks, limit)
 
 
 if __name__ == "__main__":

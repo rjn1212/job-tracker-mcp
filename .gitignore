@@ -8,3 +8,5 @@ __pycache__/
 *.db-shm
 .pytest_cache/
 .DS_Store
+.job-tracker-mcp/
+*.pre-v2

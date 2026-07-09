@@ -27,10 +27,13 @@ from job_tracker_mcp.models import (
     normalize_key_part,
     row_to_job,
 )
+# store.py depends on nothing heavier than sqlite3. Importing it here does NOT
+# pull msal or httpx into the server's startup path -- see onenote/__init__.py.
+from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -162,6 +165,7 @@ class Database:
             current = self.conn.execute("PRAGMA user_version").fetchone()[0]
             if current == 0:
                 self.conn.executescript(SCHEMA_SQL)
+                self.conn.executescript(ONENOTE_SCHEMA_SQL)
                 self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             elif current < SCHEMA_VERSION:
                 self._migrate(current, SCHEMA_VERSION)
@@ -172,6 +176,23 @@ class Database:
                 )
 
     def _migrate(self, frm: int, to: int) -> None:
+        """Called from inside _init_schema's lock and transaction. Do not re-enter either.
+
+        NOT ATOMIC, and safe anyway. sqlite3.executescript() issues an implicit
+        COMMIT before it runs, so the new tables land before the user_version
+        bump. A crash in that gap leaves v2 tables with user_version=1 -- and the
+        next open simply re-runs this, because every statement in
+        ONENOTE_SCHEMA_SQL is CREATE ... IF NOT EXISTS.
+
+        Safety here rests on idempotency, not on transactions. A future migration
+        that ALTERs, back-fills, or drops cannot rely on this and must checkpoint
+        differently.
+        """
+        if frm == 1 and to == 2:
+            self.conn.executescript(ONENOTE_SCHEMA_SQL)
+            self.conn.execute("PRAGMA user_version = 2")
+            log.info("migrated database %s from schema v1 to v2", self.path)
+            return
         raise NotImplementedError(f"No migration path from v{frm} to v{to}")
 
     # ----------------------------------------------------------- validation
@@ -258,7 +279,14 @@ class Database:
 
     @staticmethod
     def _title_similarity(a: str, b: str) -> float:
-        """Jaccard overlap of the word sets, punctuation ignored."""
+        """Jaccard overlap of the word sets, punctuation ignored.
+
+        Used by BOTH Part 1's duplicate hints and Part 2's reconciliation ladder.
+        Changing it changes which OneNote pages match which jobs. Do not swap in
+        a character-similarity metric: SequenceMatcher scores "staff engineer" vs
+        "senior staff engineer" (0.80, different level) above "staff engineer" vs
+        "staff software engineer" (0.76, same job). It inverts the answer.
+        """
         ta = {w.strip(".,()[]/") for w in a.split()} - {""}
         tb = {w.strip(".,()[]/") for w in b.split()} - {""}
         if not ta or not tb:
@@ -529,6 +557,28 @@ class Database:
         return {"jobs": [row_to_job(r) for r in rows], "total": total,
                 "offset": offset, "limit": limit}
 
+    # ------------------------------------------------ reconciliation reads
+
+    def live_jobs(self) -> list[dict]:
+        """Every non-merged job, for the reconciler. Merged rows are hidden.
+
+        Matching a OneNote page to a merged job would produce a proposed_action
+        that mark_applied then refuses.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT {JOB_COLUMNS} FROM jobs WHERE {LIVE}"
+            ).fetchall()
+        return [row_to_job(r) for r in rows]
+
+    def merged_into(self, job_id: str) -> str | None:
+        """The surviving job id, or None if this job is live (or absent)."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT merged_into FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return row["merged_into"] if row else None
+
     # --------------------------------------------------------------- merges
 
     def merge_jobs(self, keep_id: str, duplicate_id: str) -> dict:
@@ -579,6 +629,19 @@ class Database:
                 "UPDATE jobs SET merged_into = ? WHERE merged_into = ?",
                 (keep_id, duplicate_id),
             )
+            # Carry OneNote evidence across. Without this, a page linked to the
+            # duplicate hangs off a row that no listing will ever return, and
+            # reconciliation proposes a mark_applied that Part 1 then refuses.
+            # OR IGNORE handles a page already linked to BOTH rows, which would
+            # otherwise violate PRIMARY KEY(page_id, job_id); the DELETE reaps
+            # exactly those skipped rows, losing no evidence.
+            self.conn.execute(
+                "UPDATE OR IGNORE onenote_links SET job_id = ? WHERE job_id = ?",
+                (keep_id, duplicate_id),
+            )
+            self.conn.execute(
+                "DELETE FROM onenote_links WHERE job_id = ?", (duplicate_id,)
+            )
             self.conn.execute(
                 "UPDATE jobs SET merged_into = ?, updated_at = ? WHERE id = ?",
                 (keep_id, now_str(), duplicate_id),
@@ -612,7 +675,8 @@ class Database:
             "message": (
                 f"Job {id} restored. Its own fields were never modified, but the "
                 f"survivor {row['merged_into']} keeps the times_seen and notes it "
-                f"absorbed at merge time."
+                f"absorbed at merge time, and keeps any OneNote links that moved "
+                f"across -- those evidence pages describe the surviving job."
             ),
         }
 

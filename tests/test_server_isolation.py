@@ -1,0 +1,147 @@
+"""OneNote must never be able to break Part 1, or hang the stdio transport."""
+
+import asyncio
+import contextlib
+import io
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+PY = str(ROOT / ".venv" / "bin" / "python")
+
+
+def _fresh_import(env_extra: dict, code: str) -> subprocess.CompletedProcess:
+    """Import the server in a clean process so module-level state is real."""
+    import os
+    env = {k: v for k, v in os.environ.items() if not k.startswith("JOB_TRACKER_MS")}
+    env.update(env_extra)
+    return subprocess.run([PY, "-c", code], capture_output=True, text=True,
+                          env=env, cwd=str(ROOT), timeout=60)
+
+
+# Neither httpx nor requests is asserted absent: fastmcp imports httpx directly,
+# and its jsonref dependency imports requests. Both are in the startup path
+# whatever Part 2 does. What MUST stay out is msal (which reads the Keychain) and
+# the onenote modules that build a Graph client -- those are what would turn a
+# startup failure into a server that Claude Desktop sees as crashed, with no
+# diagnosable output. Assert the invariant we actually control.
+IMPORT_AND_COUNT = """
+import asyncio, contextlib, io, sys
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    from job_tracker_mcp import server
+assert buf.getvalue() == "", "stdout polluted: %r" % buf.getvalue()
+tools = asyncio.run(server.mcp.list_tools())
+assert all(t.description for t in tools), "a tool has no description"
+sys.stderr.write("TOOLS=%d\\n" % len(tools))
+assert "msal" not in sys.modules, "msal imported at startup"
+for mod in ("service", "auth", "graph", "client"):
+    full = "job_tracker_mcp.onenote." + mod
+    assert full not in sys.modules, full + " imported at startup"
+"""
+
+
+def test_import_without_client_id(tmp_path):
+    """Registers every tool, writes nothing to stdout, pulls in no network stack."""
+    r = _fresh_import({"JOB_TRACKER_DB": str(tmp_path / "t.db")}, IMPORT_AND_COUNT)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+    assert "TOOLS=25" in r.stderr
+
+
+def test_database_constructor_imports_no_network_stack(tmp_path):
+    """Point 4 of Failure Isolation: db = Database() runs before FastMCP listens."""
+    # Database alone must pull in NO network stack at all -- not even httpx.
+    code = (
+        "import sys\n"
+        "from job_tracker_mcp.database import Database\n"
+        "Database()\n"
+        "for mod in ('msal', 'httpx', 'requests'):\n"
+        "    assert mod not in sys.modules, mod + ' imported by Database()'\n"
+    )
+    r = _fresh_import({"JOB_TRACKER_DB": str(tmp_path / "t.db")}, code)
+    assert r.returncode == 0, r.stderr
+
+
+def test_part1_tools_unaffected(tmp_path):
+    code = (
+        "import sys\n"
+        "from job_tracker_mcp import server\n"
+        "r = server.add_job('Acme', 'Staff Engineer', 'Remote, US')\n"
+        "assert r['result'] == 'created', r\n"
+        "s = server.get_stats()\n"
+        "assert s['total_jobs'] == 1, s\n"
+        "assert server.merge_jobs('x', 'x')['error']\n"
+    )
+    r = _fresh_import({"JOB_TRACKER_DB": str(tmp_path / "t.db")}, code)
+    assert r.returncode == 0, r.stderr
+
+
+# --------------------------------------- unconfigured OneNote degrades cleanly
+
+@pytest.fixture
+def unconfigured(monkeypatch, tmp_path):
+    monkeypatch.delenv("JOB_TRACKER_MS_CLIENT_ID", raising=False)
+    monkeypatch.setenv("JOB_TRACKER_DB", str(tmp_path / "t.db"))
+    from job_tracker_mcp.database import Database
+    from job_tracker_mcp.onenote.service import OneNoteService
+    db = Database(db_path=tmp_path / "t.db")
+    yield OneNoteService(db)
+    db.close()
+
+
+def test_auth_status_unconfigured_is_a_diagnosis_not_an_error(unconfigured):
+    """'You have not set this up yet' is a SUCCESSFUL diagnosis.
+
+    An error string would send the model hunting for a bug.
+    """
+    out = unconfigured.auth_status()
+    assert "error" not in out
+    assert out["configured"] is False
+    assert out["authenticated"] is False
+    assert out["reason"] == "not_configured"
+    assert "entra.microsoft.com" in out["message"]
+
+
+def test_auth_status_never_hits_network(unconfigured):
+    unconfigured.auth_status()          # the _no_network fixture would explode
+
+
+def test_onenote_tools_unconfigured_return_errors_not_exceptions(unconfigured):
+    from job_tracker_mcp.onenote.auth import AuthError
+    with pytest.raises(AuthError):      # server.py's _onenote_guard turns this into {"error"}
+        unconfigured.list_sections()
+
+
+def test_cached_reads_work_with_no_auth(unconfigured):
+    """Reading the mirror must never require a token."""
+    assert unconfigured.store.list_pages()["total"] == 0
+    assert unconfigured.get_page("nope")["error"]
+    assert unconfigured.store.search_pages("x")["total"] == 0
+
+
+def test_reconcile_works_offline(unconfigured):
+    unconfigured.db.add_job(company="Acme", title="Staff Engineer", location="Remote")
+    out = unconfigured.reconcile()
+    assert "error" not in out
+    assert out["matched_count"] == 0
+    assert out["dry_run"] is True
+
+
+def test_create_page_requires_write_env(unconfigured, monkeypatch):
+    monkeypatch.delenv("JOB_TRACKER_ONENOTE_WRITE", raising=False)
+    out = unconfigured.create_page("T", ["b"], confirm=True)
+    assert "JOB_TRACKER_ONENOTE_WRITE" in out["error"]
+
+
+def test_stdout_purity_of_onenote_imports():
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        import job_tracker_mcp.onenote.auth  # noqa: F401
+        import job_tracker_mcp.onenote.client  # noqa: F401
+        import job_tracker_mcp.onenote.graph  # noqa: F401
+        import job_tracker_mcp.onenote.service  # noqa: F401
+    assert buf.getvalue() == ""

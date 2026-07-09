@@ -22,10 +22,34 @@ Today that answer lives in two places that do not know about each other: the `jo
 - Every tool wrapped in `@_tool_guard`.
 - `database.py` holds the logic; `server.py` is a thin adapter.
 - Tests never touch `data/jobs.db`.
+- **Fail toward a visible discrepancy, never a silent false match.** Part 1's governing
+  principle, inherited verbatim. A duplicate row or an `ambiguous` entry is annoying and
+  correctable; a wrong match quietly destroys the record of a job you applied to.
 
-**Changes to Part 1 code are limited to exactly three lines of `database.py`** (see
-[Schema v2](#schema-v2--the-only-part-1-diff)). No existing table, column, tool, or test is
-modified. That is a deliberate design goal of this document, not an accident.
+### Part 1 is shipped; this phase integrates with it
+
+An earlier draft of this document declared that *"changes to Part 1 code are limited to
+exactly three lines of `database.py`."* That was **scaffolding to keep this plan from
+disturbing Part 1 while Part 1 was still being built.** Part 1 has shipped. The constraint has
+expired, and honoring it now would produce a worse system: reconciliation would reimplement
+normalization that already exists, and OneNote links would silently orphan themselves the
+first time two jobs are merged.
+
+Part 2 therefore modifies Part 1 where integration demands it. The changes are enumerated in
+[Changes to Part 1](#changes-to-part-1), and each is small.
+
+### What Part 1 actually shipped (this document was drafted against an older version)
+
+| Assumption in the first draft | Reality |
+|---|---|
+| Part 1 has **13** tools; Part 2 adds 14–23 for 23 total | Part 1 has **15** tools. Part 2 adds **16–25**, for **25** total. |
+| `jobs` has no normalized columns | `jobs` has indexed `company_canonical`, `title_canonical`, `location_canonical` |
+| Matching should use `normalize_key_part()` | Use `canonicalize_company()` / `canonicalize_title()` — they strip legal suffixes and board decorations |
+| Fuzzy title matching = `difflib.SequenceMatcher` | Part 1 removed that metric as **provably wrong**; use its `_title_similarity()` (Jaccard) |
+| Jobs are deleted (`ON DELETE CASCADE` fires) | Jobs are **never** deleted. They are merged: `merged_into` points at the survivor. |
+| `_migrate` is an unimplemented stub | Still true, and Part 2 implements 1→2 |
+
+Every row of that table is a live defect if ignored. They are corrected in place below.
 
 ---
 
@@ -126,7 +150,7 @@ resolved `sections/{id}`. Never use `sectionName`. This is a hard rule.
 ```
                        ┌──────────────────────────────────────┐
                        │            server.py                  │
-                       │  (thin adapter, +10 tools, 23 total)  │
+                       │  (thin adapter, +10 tools, 25 total)  │
                        └───────────┬──────────────┬───────────┘
                                    │              │
                      ┌─────────────▼──┐      ┌────▼───────────────┐
@@ -147,7 +171,7 @@ resolved `sections/{id}`. Never use `sectionName`. This is a hard rule.
                                │
                      ┌─────────▼────────────────────────┐
                      │        data/jobs.db (v2)          │
-                     │  jobs, rejected_patterns          │  ← Part 1, untouched
+                     │  jobs, rejected_patterns          │  ← Part 1, schema untouched
                      │  onenote_pages   (content cache)  │  ← Part 2, new
                      │  onenote_links   (page ↔ job)     │  ← Part 2, new
                      │  onenote_state   (resolved ids)   │  ← Part 2, new
@@ -162,7 +186,7 @@ Two rules the diagram encodes:
 
 1. **The Graph layer is downstream of nothing.** Importing `server.py` must not construct a
    Graph client, read a token, or open a socket. A user with no network, no Azure app, and
-   no token still gets all 13 Part-1 tools working perfectly. OneNote tools return a clean
+   no token still gets all 15 Part-1 tools working perfectly. OneNote tools return a clean
    `{"error": "Not authenticated. Run ./onenote-auth.sh"}`.
 2. **OneNote content is cached locally in `jobs.db`.** Reconciliation runs against the cache,
    not against the network. `onenote_sync` is the only tool that must be online.
@@ -172,7 +196,7 @@ Two rules the diagram encodes:
 ```
 job_tracker_mcp/
 ├── __init__.py
-├── server.py                    # +9 tools
+├── server.py                    # +10 tools
 ├── database.py                  # +3 lines (SCHEMA_VERSION, _migrate, fresh-create)
 ├── models.py                    # unchanged
 └── onenote/                     # NEW package
@@ -182,6 +206,7 @@ job_tracker_mcp/
     ├── client.py                # OneNoteClient: resolve/list/read/create
     ├── htmlio.py                # HTML -> text (stdlib), text -> OneNote page HTML
     ├── store.py                 # OneNoteStore: the 3 new tables, all SQL
+    ├── service.py               # orchestration: env, resolution, sync phases, reconcile
     └── reconcile.py             # matching + diff, pure functions
 
 onenote-auth.sh                  # NEW: interactive one-time sign-in wrapper
@@ -261,12 +286,31 @@ _KEYRING_USER = "msal-token-cache"
 
 - `msal.PublicClientApplication(client_id, authority=AUTHORITY, token_cache=cache)`.
 - **Token cache persistence:** `msal.SerializableTokenCache`, serialized to the **macOS
-  Keychain** via `keyring` (already installed — it is a transitive dep of `fastmcp` 3.4.4;
-  confirm with `pip show keyring` before relying on it, and declare it explicitly in
-  `requirements.txt` regardless, because depending on a transitive dep is how builds break).
+  Keychain** via `keyring` (confirmed present: `keyring 25.7.0`, arriving transitively via
+  `fastmcp` → `fastmcp-slim`; declare it explicitly in `requirements.txt` regardless, because
+  depending on a transitive dep is how builds break).
   Fallback if `keyring` raises (headless / no Keychain): a file at `~/.job-tracker-mcp/
   msal_cache.json` created with `os.open(..., O_CREAT|O_EXCL|O_WRONLY, 0o600)`. Never inside
   the repo. Add `.job-tracker-mcp/` to `.gitignore` anyway, belt and braces.
+
+> ### A Keychain prompt will hang the server, and it does not raise
+>
+> The fallback above triggers "if `keyring` raises." **A macOS *"allow access"* dialog does
+> not raise — it blocks.** Indefinitely. In a process Claude Desktop launched with no TTY, no
+> window, and no one to click the button.
+>
+> This is not hypothetical. The Keychain item's ACL is bound to the binary that created it.
+> `onenote-auth.sh` writes it with `.venv/bin/python`. Delete and recreate `.venv`, upgrade
+> Python, or move the checkout, and the reading binary no longer matches — macOS then prompts,
+> and the MCP server hangs on startup of the first OneNote tool call.
+>
+> Mitigations, all three:
+> - Read the cache **on a worker thread with a hard timeout** (5s). On timeout, do not wait:
+>   return the standard *"run `onenote-auth.sh`"* error. A hung tool is strictly worse than a
+>   failed one, because the model cannot see it.
+> - `onenote_auth_status` performs the same timed read and reports
+>   `{"authenticated": false, "reason": "keychain_timeout"}` — a *diagnosis*, not an error.
+> - The README states plainly: **rebuilding `.venv` requires re-running `onenote-auth.sh`.**
 - `acquire_token_silent(SCOPES, account=accounts[0])` on every call. MSAL handles refresh and
   the 5-minute-early renewal internally. Do not cache the access token yourself.
 - **Multi-account:** `get_accounts()` may return more than one (personal + work). Persist the
@@ -398,20 +442,30 @@ duplicates causes a 400. Request the nextLink verbatim.
 
 ---
 
-## Schema v2 — The Only Part-1 Diff
+## Changes to Part 1
 
-`jobs` and `rejected_patterns` are **not touched**: no new columns, no changed constraints,
-no reindex. Reconciliation matching happens in Python over a `SELECT` of a few thousand rows,
-which costs microseconds and buys total isolation from Part 1's persisted natural key. This
-is deliberate — adding `company_norm`/`title_norm` columns would have been faster to query
-and would have coupled Part 2 to the very key-versioning hazard that Part 1's spec spends a
-page warning about.
+Small, enumerated, and each one required by integration rather than convenience.
+
+| File | Change | Why |
+|---|---|---|
+| `database.py` | `SCHEMA_VERSION = 2` | new tables |
+| `database.py` | `_init_schema` also runs `ONENOTE_SCHEMA_SQL` on fresh create | new tables |
+| `database.py` | `_migrate` implements 1→2 (was `NotImplementedError`) | Randy's live db is v1 and populated |
+| `database.py` | `merge_jobs` re-points `onenote_links` from duplicate to survivor | otherwise a merge orphans a page's evidence |
+| `database.py` | `unmerge_job`'s message states that links stay with the survivor | honesty about a non-inverse |
+| `database.py` | `_title_similarity` gains a docstring noting Part 2 depends on it | changing it now changes reconciliation |
+| `server.py` | `logging.getLogger("msal").setLevel(WARNING)` before any onenote import | stdout purity |
+| `.gitignore` | `.job-tracker-mcp/`, `*.pre-v2` | token-cache fallback, migration backup |
+
+`jobs` and `rejected_patterns` gain **no new columns** — that part of the original goal
+survives, and for the original reason: Part 1's persisted natural key is versioned, and adding
+a column that participates in matching would drag Part 2 into that versioning hazard.
+Reconciliation reads the canonical columns Part 1 already maintains.
 
 The three new tables live in the **same** `jobs.db`, because `onenote_links.job_id` must be a
-real foreign key into `jobs(id)` and `ON DELETE CASCADE` must fire. A second database file
-cannot do that.
+real foreign key into `jobs(id)`. A second database file cannot do that.
 
-### The diff to `database.py`
+### Schema v2 and the migration
 
 ```python
 SCHEMA_VERSION = 2                                   # was 1
@@ -424,26 +478,48 @@ def _init_schema(self):
             self.conn.executescript(ONENOTE_SCHEMA_SQL)      # <- added
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current < SCHEMA_VERSION:
-            self._migrate(current, SCHEMA_VERSION)
+            self._migrate(current, SCHEMA_VERSION)           # called INSIDE this txn
         ...
 
 def _migrate(self, frm: int, to: int) -> None:
+    # No `with self._lock, self.conn:` here -- _init_schema already holds both.
+    # RLock is reentrant, but re-entering `with self.conn` commits early and obscures
+    # the control flow.
     if frm == 1 and to == 2:
-        with self._lock, self.conn:
-            self.conn.executescript(ONENOTE_SCHEMA_SQL)      # additive only
-            self.conn.execute("PRAGMA user_version = 2")
+        self.conn.executescript(ONENOTE_SCHEMA_SQL)          # additive only
+        self.conn.execute("PRAGMA user_version = 2")
         return
     raise NotImplementedError(f"No migration path from v{frm} to v{to}")
 ```
 
-The 1→2 migration is purely additive: it creates tables and touches no existing row. It is
-therefore safe to run on Randy's live `data/jobs.db` with no backup. (Take one anyway:
-`cp data/jobs.db data/jobs.db.pre-v2`. Part 1's README already notes there is no backup
-story; this is the moment it matters.)
+> ### The migration is not atomic, and that is fine — for a reason worth writing down
+>
+> The first draft implied the migration was transactional. **It is not.** Python's
+> `sqlite3.executescript()` **issues an implicit `COMMIT` before it runs**, discarding any
+> pending transaction. Verified on this machine's Python 3.11.11:
+>
+> ```
+> in_transaction before executescript: True
+> in_transaction after  executescript: False
+> ```
+>
+> So `executescript(ONENOTE_SCHEMA_SQL)` commits the new tables, and `PRAGMA user_version = 2`
+> lands afterward. A crash in the gap leaves the v2 tables present with `user_version` still 1.
+>
+> This is safe **because the migration is idempotent, not because it is atomic.** Every
+> statement is `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so the next open
+> re-runs it harmlessly and sets the version. Any future migration that is *not* idempotent —
+> one that `ALTER`s, back-fills, or drops — cannot rely on this and must checkpoint
+> differently. Do not copy this pattern without re-reading this paragraph.
+
+The 1→2 migration touches no existing row, so it is safe to run on Randy's live `data/jobs.db`.
+Take a backup anyway: `cp data/jobs.db data/jobs.db.pre-v2`. Part 1's README notes there is no
+backup story; this is the moment it matters.
 
 **`PRAGMA foreign_keys = ON` is already set per-connection by Part 1** — the `ON DELETE
-CASCADE` below is live, not decorative. Verify this in a test; a FK that silently does
-nothing is worse than no FK.
+CASCADE` below is live, not decorative. Verify it in a test; a FK that silently does nothing is
+worse than no FK. (`onenote_links` → `onenote_pages` is the cascade that will actually fire;
+the one into `jobs` will not, because Part 1 never deletes a job.)
 
 ### `ONENOTE_SCHEMA_SQL`
 
@@ -475,12 +551,14 @@ CREATE INDEX IF NOT EXISTS idx_onp_live     ON onenote_pages(deleted_at, is_igno
 
 -- The join. A page may describe several jobs; a job may appear on several pages.
 CREATE TABLE IF NOT EXISTS onenote_links (
-    page_id     TEXT NOT NULL REFERENCES onenote_pages(page_id) ON DELETE CASCADE,
-    job_id      TEXT NOT NULL REFERENCES jobs(id)               ON DELETE CASCADE,
-    match_kind  TEXT NOT NULL,   -- marker | exact | fuzzy | manual | created_by_tool
-    confidence  REAL NOT NULL,   -- 1.0 for marker/manual/created_by_tool
-    evidence    TEXT,            -- the snippet or reasoning that produced the match
-    created_at  TEXT NOT NULL,
+    page_id      TEXT NOT NULL REFERENCES onenote_pages(page_id) ON DELETE CASCADE,
+    job_id       TEXT NOT NULL REFERENCES jobs(id)               ON DELETE CASCADE,
+    match_kind   TEXT NOT NULL,   -- marker | exact | fuzzy | manual | created_by_tool
+    confidence   REAL NOT NULL,   -- 1.0 for marker/manual/created_by_tool
+    evidence     TEXT,            -- the snippet or reasoning that produced the match
+    date_applied TEXT,            -- ISO date the PAGE says the application happened
+    extracted    TEXT,            -- JSON blob of whatever was parsed/read off the page
+    created_at   TEXT NOT NULL,
 
     PRIMARY KEY (page_id, job_id),
     CHECK (match_kind IN ('marker','exact','fuzzy','manual','created_by_tool')),
@@ -510,6 +588,44 @@ Notes on shape:
   reconciler must be told to skip those, once, permanently.
 - `onenote_links.job_id` is `NOT NULL`. An *unmatched* page is not a link with a null job —
   it is simply the absence of a row. Modelling "no match" as a row invites `LEFT JOIN` bugs.
+
+- **`date_applied` on the link is what makes Tier-B extraction work.** Tier B is declared the
+  *primary* path: the model reads an unparsed page and calls `onenote_link_page`. Without a
+  date on the link row, reconciliation has nothing to pass to `mark_applied` and would record
+  **today** as the day you applied — permanently, and wrongly, for an application you made in
+  June. The date the page asserts belongs on the link, alongside the `extracted` JSON that
+  justifies it.
+
+- **`ON DELETE CASCADE` into `jobs(id)` is correct but will never fire.** Part 1 never deletes
+  a job; it merges them (`merged_into`). Keep the FK — it costs nothing and documents intent —
+  but the live hazard is a *merged* job, not a deleted one. See below.
+
+### `merged_into` is the hazard the first draft did not know about
+
+Part 1 shipped after this document was first drafted, and it can now merge two jobs: the
+duplicate keeps its row, gains `merged_into = <survivor>`, and disappears from every listing.
+
+Link a page to job **B**, then merge **B** into **A**, and the page's evidence now hangs off a
+row that `get_jobs` will never return. Reconciliation would surface it, propose
+`mark_applied(B)`, and Part 1 would refuse with *"job B was merged into A."* The link is
+orphaned in place, silently.
+
+**`merge_jobs` must therefore carry the links across.** Inside its existing transaction, after
+re-pointing merge pointers:
+
+```sql
+-- A page already linked to BOTH rows must not violate PRIMARY KEY(page_id, job_id).
+UPDATE OR IGNORE onenote_links SET job_id = :keep WHERE job_id = :dup;
+DELETE FROM onenote_links WHERE job_id = :dup;      -- whatever OR IGNORE skipped
+```
+
+`UPDATE OR IGNORE` moves every link it can; the `DELETE` reaps the collisions it skipped
+(those pages were already linked to the survivor, so no evidence is lost). `unmerge_job` does
+**not** restore the links — they now legitimately describe the survivor, and a page's evidence
+following the job it documents is the behavior you want. Say so in `unmerge_job`'s message.
+
+Every reconciliation query filters `merged_into IS NULL`. `onenote_link_page` refuses a
+`job_id` whose row is merged, naming the survivor.
 
 ---
 
@@ -546,6 +662,25 @@ def build_page_html(title: str, body_lines: list[str], created: str | None = Non
                     marker: str | None = None) -> str:
 ```
 
+The exact document Graph expects. **`title` is not a parameter of the POST — Graph reads it
+from `<title>` in `<head>`.** Omit the head and the page is created untitled; the first draft
+never pinned this shape.
+
+```html
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Applied: Staff Engineer @ Acme Corp</title>
+    <meta name="created" content="2026-07-09T16:29:04-07:00" />
+  </head>
+  <body>
+    <p>Applied via the company site.</p>
+    <p>Recruiter: Dana</p>
+    <p><i>job-tracker-id: a1b2c3d4e5f60718</i></p>
+  </body>
+</html>
+```
+
 - Escape `title` and every body line with `html.escape(..., quote=True)`. A job title
   containing `&` or `<` — `R&D Engineer`, `Engineer <Backend>` — must not produce broken
   markup or, worse, inject markup. This is the injection boundary of Part 2, and the content
@@ -572,7 +707,8 @@ def build_page_html(title: str, body_lines: list[str], created: str | None = Non
 
 ## MCP Tools — Part 2
 
-Ten new tools (14–23). Server total: **23**.
+Ten new tools (16–25). Server total: **25** (Part 1 shipped 15, not the 13 this document
+first assumed).
 
 Every one is `@mcp.tool` + `@_tool_guard`, returns a plain dict, and follows Part 1's error
 envelope. Every docstring states when to prefer it over a sibling — that text is what the
@@ -580,7 +716,7 @@ model actually reads.
 
 ---
 
-### Tool 14: `onenote_auth_status`
+### Tool 16: `onenote_auth_status`
 
 **Purpose:** Diagnose the OneNote connection without touching a notebook. The first tool to
 call when anything OneNote-shaped fails.
@@ -613,7 +749,7 @@ interactive auth.
 
 ---
 
-### Tool 15: `onenote_list_sections`
+### Tool 17: `onenote_list_sections`
 
 **Purpose:** One-time discovery. Enumerate notebooks and their sections so the user can
 confirm the exact `displayName`s, or find the right ids when names are ambiguous.
@@ -641,7 +777,7 @@ inference from backup filenames.
 
 ---
 
-### Tool 16: `onenote_sync`
+### Tool 18: `onenote_sync`
 
 **Purpose:** Refresh the local mirror of the `Job Searching` section. **The only tool that
 requires the network.** Everything else reads the cache.
@@ -671,30 +807,57 @@ max_pages     int   optional  default 200, clamped [1, 1000]
 }
 ```
 
-**Logic:**
+**Logic, in three strictly separated phases.** The phase boundary is the whole design.
+
+**Phase R — read the DB, release the lock.** One short transaction: load the current
+`(page_id, last_modified_dt, content_synced_dt)` for the section. If `full=True`, treat every
+`content_synced_dt` as `NULL`.
+
+**Phase N — network, holding no lock and no transaction.**
 1. Resolve/validate `section_id` (see [Resolving](#resolving-the-notebook-and-section)).
 2. `GET /me/onenote/sections/{id}/pages?$top=100&$select=id,title,createdDateTime,lastModifiedDateTime,links`,
    following `@odata.nextLink`. Stop at `max_pages` and, if more remain,
    **say so in `message`** — a silently truncated sync that reports success is how a
    reconciliation report ends up confidently wrong.
-3. Upsert each row into `onenote_pages`. Set `last_seen_at = now`.
-4. For each page where `fetch_content` and
+3. For each enumerated page where `fetch_content` and
    `content_synced_dt IS NULL OR content_synced_dt != last_modified_dt`:
-   `GET /me/onenote/pages/{id}/content`, run `html_to_text`, store both, set
-   `content_synced_dt = last_modified_dt`.
+   `GET /me/onenote/pages/{id}/content`, run `html_to_text`, accumulate **in memory**.
+
+**Phase W — one short write transaction, no network inside it.**
+4. Upsert every enumerated page into `onenote_pages`; set `last_seen_at = now`; write the
+   fetched `content_html` / `content_text` and set `content_synced_dt = last_modified_dt`.
 5. Any non-tombstoned page in the table whose `page_id` was **not** returned by the
    enumeration gets `deleted_at = now`. Never `DELETE`.
-6. `full=True` clears `content_synced_dt` first, forcing a refetch of everything. This is the
-   escape hatch for when the local text extractor has been improved and the cache is stale
+
+> ### Never hold the database lock across an HTTP call
+>
+> The first draft said *"all of steps 3–5 run in one transaction"* — with the content fetch
+> as step 4, **inside** it. That is a production hang, not a nit.
+>
+> Part 1's `Database` serializes **every** method on a single `threading.RLock` over a single
+> `sqlite3.Connection`. A sync of 40 changed pages would hold that lock, and an open SQLite
+> write transaction, across 40 sequential network round-trips. For the duration — seconds on a
+> good link, minutes on a bad one, indefinitely if Graph stalls before the httpx timeout — every
+> other tool in the server blocks. `get_jobs` blocks. `add_job` blocks. The server looks dead.
+>
+> Phase N therefore takes no lock and opens no transaction. Phase W is a single fast commit.
+> A sync interrupted during Phase N leaves the database exactly as it was; interrupted during
+> Phase W, the transaction rolls back. Neither can leave half the section tombstoned.
+>
+> `test_sync_holds_no_lock_during_http` asserts this directly: the mock transport's handler
+> tries `db._lock.acquire(blocking=False)` mid-request and fails the test if it cannot.
+
+6. `full=True` forces a refetch of everything (Phase R reports every page as uncached). This is
+   the escape hatch for when the local text extractor has been improved and the cache is stale
    *with respect to the parser*, not with respect to Graph — a real scenario the
    `last_modified_dt` key cannot detect.
 
-**All of steps 3–5 run in one transaction.** A sync interrupted halfway must not leave half
-the section tombstoned.
+Phase N is also where `throttled_retries` accumulates, and where a `max_pages` truncation is
+recorded so Phase W can surface it in `message`.
 
 ---
 
-### Tool 17: `onenote_list_pages`
+### Tool 19: `onenote_list_pages`
 
 **Purpose:** List cached pages in the section. Reads the local mirror; **never** hits the
 network. Call `onenote_sync` first if you need it fresh.
@@ -729,7 +892,7 @@ order total so pagination cannot skip or repeat a row — same reasoning as Part
 
 ---
 
-### Tool 18: `onenote_get_page`
+### Tool 20: `onenote_get_page`
 
 **Purpose:** Read one page's content as plain text.
 
@@ -761,7 +924,7 @@ offset    int   optional  default 0   (character offset, for paging through a lo
 
 ---
 
-### Tool 19: `onenote_search_pages`
+### Tool 21: `onenote_search_pages`
 
 **Purpose:** Substring search across cached page titles and text. Finds "did I write anything
 about Acme?" without pulling every page into context.
@@ -780,7 +943,7 @@ search, it is a denial-of-service on the context window.
 
 ---
 
-### Tool 20: `onenote_create_page`
+### Tool 22: `onenote_create_page`
 
 **Purpose:** Create a new page in the `Job Searching` section. **The only tool that writes to
 OneNote.** Gated behind `JOB_TRACKER_ONENOTE_WRITE=1`.
@@ -838,24 +1001,36 @@ person's notes. Out of scope. If Part 3 wants it, it needs its own spec.
 
 ---
 
-### Tool 21: `onenote_link_page`
+### Tool 23: `onenote_link_page`
 
 **Purpose:** Manually assert that a page documents a job, when automatic matching could not.
 Also the tool to *un*-link a wrong match.
 
 **Parameters:**
 ```
-page_id  str   required
-job_id   str   required
-unlink   bool  optional  default False
-evidence str   optional
+page_id      str   required
+job_id       str   required
+unlink       bool  optional  default False
+evidence     str   optional  (the snippet that justifies the link)
+date_applied str   optional  ISO "YYYY-MM-DD" — the date THE PAGE says you applied
+extracted    dict  optional  whatever else was read off the page
 ```
 
 **Returns:** `{"result": "linked" | "unlinked" | "exists", "page_id": ..., "job_id": ...}`
 
-Writes `match_kind='manual'`, `confidence=1.0`. A manual link **always wins** over a `fuzzy`
-one and is never overwritten by a later reconciliation — reconcile only ever inserts
-`marker`/`exact`/`fuzzy` rows with `INSERT ... ON CONFLICT DO NOTHING`.
+Writes `match_kind='manual'`, `confidence=1.0`. A manual link **always wins** and is never
+overwritten by a later reconciliation — reconcile only ever inserts `marker`/`exact`/`fuzzy`
+rows with `INSERT ... ON CONFLICT DO NOTHING`.
+
+`date_applied` is what closes the Tier-B loop, and it is not optional in spirit. Tier B is the
+*primary* extraction path: the model reads a page, sees *"Applied to Staff Engineer at Acme,
+7/2"*, and links it. If that `7/2` is not carried onto the link row, `reconcile_applications`
+has nothing to hand `mark_applied`, defaults to today, and records — permanently — that you
+applied on the day you happened to run reconciliation. The docstring must tell the model to
+pass the date it just read.
+
+Rejects a `job_id` whose row has `merged_into` set, naming the survivor. Linking evidence to a
+hidden row is how evidence gets lost.
 
 `unlink=True` on a `created_by_tool` link is refused: that row is the record that this server
 created a page, and deleting it would let a second page be created for the same job. Error:
@@ -863,7 +1038,7 @@ created a page, and deleting it would let a second page be created for the same 
 
 ---
 
-### Tool 22: `reconcile_applications`
+### Tool 24: `reconcile_applications`
 
 **Purpose:** *The point of Part 2.* Cross-reference the `jobs` table against the OneNote
 mirror and report where they disagree.
@@ -871,7 +1046,7 @@ mirror and report where they disagree.
 **Parameters:**
 ```
 dry_run          bool  optional  default True
-min_confidence   float optional  default 0.85, clamped [0.5, 1.0]
+min_confidence   float optional  default 0.6, clamped [0.3, 1.0]   -- Jaccard scale, == Part 1's DUP_THRESHOLD
 apply_marks      bool  optional  default False   (mark_applied for OneNote-only applications)
 limit            int   optional  default 100
 ```
@@ -879,7 +1054,11 @@ limit            int   optional  default 100
 **Returns:**
 ```json
 {
-  "matched": 28,
+  "matched": [
+    {"page_id": "1-w...", "job_id": "b3c4...", "match_kind": "marker", "confidence": 1.0,
+     "agrees": true}
+  ],
+  "matched_count": 28,
   "onenote_only": [
     {"page_id": "1-x...", "page_title": "Applied: Staff Eng @ Acme",
      "extracted": {"company": "Acme Corp", "title": "Staff Engineer", "date_applied": "2026-07-02"},
@@ -891,6 +1070,11 @@ limit            int   optional  default 100
     {"job_id": "f7e6...", "company": "Beta Inc", "title": "Principal Engineer",
      "date_applied": "2026-06-28", "status": "applied",
      "proposed_action": "onenote_create_page(job_id='f7e6...')"}
+  ],
+  "unmatched": [
+    {"page_id": "1-v...", "page_title": "July log",
+     "extracted": {"company": "Initech", "title": "Staff Engineer", "date_applied": "2026-07-04"},
+     "proposed_action": "add_job(company='Initech', title='Staff Engineer', location='Unknown') then mark_applied"}
   ],
   "ambiguous": [
     {"page_id": "1-y...", "extracted": {"company": "Acme", "title": "Sr Staff Eng"},
@@ -909,29 +1093,104 @@ limit            int   optional  default 100
 }
 ```
 
+### The `unmatched` bucket
+
+Found while building: a page row that parses cleanly and names a company the tracker has
+never seen matched nothing, and was reported **nowhere** -- neither `onenote_only` (no job),
+nor `ambiguous` (no candidates), nor `unparsed_pages` (it parsed fine). A job you applied to,
+silently omitted from the report. Exactly the failure this whole design exists to prevent.
+
+Such records now land in `unmatched`, with `add_job(...)` as the proposed action. Pinned by
+`test_different_company_is_unmatched_not_silent`.
+
+`matched` is a **list, not a bare count.** The first draft returned `"matched": 28`, which is
+unauditable: a reconciler that reports 28 matches and 0 discrepancies is indistinguishable
+from one that matched 28 things wrongly. Each entry names the page, the job, how they were
+joined, and whether the two sources agree on status. `matched_count` is there for the summary
+line. If the list would be enormous, truncate it and say so in `message` — never silently.
+
 ### The matching ladder
 
 Applied in order; the first hit wins and stops the ladder for that page.
 
 | Tier | `match_kind` | Rule | Confidence |
 |---|---|---|---|
-| 1 | `marker` | `job-tracker-id: <16 hex>` found in `content_text` | `1.0` |
-| 2 | `manual` | Pre-existing row in `onenote_links` | `1.0` |
-| 3 | `exact` | `normalize_key_part(company)` **and** `normalize_key_part(title)` both equal a job's | `1.0` |
-| 4 | `fuzzy` | company exact **and** `difflib.SequenceMatcher(None, t1, t2).ratio() >= min_confidence` on title | the ratio |
-| 5 | — | company exact, several titles ≥ 0.70 → **`ambiguous`**, never auto-applied | — |
+| 1 | `manual` | Pre-existing `manual` row in `onenote_links` | `1.0` |
+| 2 | `marker` | `job-tracker-id: <16 hex>` found in `content_text` | `1.0` |
+| 3 | `exact` | `canonicalize_company(c)` **and** `canonicalize_title(t)` both equal a live job's | `1.0` |
+| 4 | `fuzzy` | company canonical-equal **and** `_title_similarity(t1, t2) >= min_confidence` | the score |
+| 5 | — | company canonical-equal, several titles ≥ `AMBIGUOUS_FLOOR` → **`ambiguous`** | — |
+
+**Manual outranks marker**, reversing the first draft. A marker is machine-written and exact,
+but it can go **stale**: duplicate a page as a template, edit it to describe a different role,
+and the old `job-tracker-id` rides along in the body text. A human who has just looked at the
+page and asserted a link has strictly better information than a string copied from a page they
+forgot they copied. Markers still beat everything below them.
+
+**Only live jobs participate.** Every query behind tiers 3–5 filters `merged_into IS NULL`.
+Matching a page to a merged, hidden job would produce a `proposed_action` that Part 1 then
+refuses.
+
+### The fuzzy metric: reuse Part 1's, do not reinvent
+
+The first draft specified `difflib.SequenceMatcher(None, t1, t2).ratio()`. **That metric is
+wrong, and wrong in a way that inverts the answer.** Measured on the real strings:
+
+| Pair | `SequenceMatcher` | `_title_similarity` (Jaccard) | Truth |
+|---|---|---|---|
+| `staff engineer` / `staff software engineer` | 0.76 | **0.67** | same requisition |
+| `staff engineer` / `senior staff engineer` | **0.80** | 0.67 | different level |
+| `backend engineer` / `frontend engineer` | 0.73 | **0.33** | different roles |
+
+`SequenceMatcher` ranks a *different seniority level* (0.80) **above** the true duplicate
+(0.76). No threshold can separate them; the ladder would confidently match the wrong job.
+Characters measure spelling. Word-set overlap measures meaning. Part 1 already learned this,
+deleted the character metric, and pinned the lesson with a regression test. Import
+`Database._title_similarity` — do not write a second copy, and do not reach for `difflib`.
+
+**Threshold recalibration follows from the metric.** The first draft's `min_confidence=0.85`
+matches **nothing** — the true duplicate above scores 0.67 — and a reconciler that matches
+nothing reports "0 discrepancies" and looks like it is working. That is finding #1's failure
+mode wearing a different hat.
+
+```python
+DEFAULT_MIN_CONFIDENCE = 0.6      # == Part 1's DUP_THRESHOLD; same metric, same scale
+AMBIGUOUS_FLOOR        = 0.5      # below min_confidence: "worth a human glance"
+```
+
+`min_confidence` is clamped to `[0.3, 1.0]`. Any change to `_title_similarity` changes both
+Part 1's duplicate hints and Part 2's reconciliation; that coupling is intentional and the
+docstring must say so.
 
 **Location is deliberately excluded from matching.** This is the central insight and the
 reason `generate_job_id()` cannot be used here. Part 1's id is
-`sha256(company | title | location_canonical)`, but a hand-written OneNote note says
-*"Applied to Staff Engineer at Acme, 7/2"* — it almost never records the location. Hashing
-`(company, title, "unknown")` produces an id that matches **nothing**, and a reconciler that
-silently matches nothing reports "0 discrepancies" and looks like it works.
+`sha256(company_canonical | title_canonical | location_canonical)`, but a hand-written OneNote
+note says *"Applied to Staff Engineer at Acme, 7/2"* — it almost never records the location.
+Hashing `(company, title, "unknown")` produces an id that matches **nothing**, and a
+reconciler that silently matches nothing reports "0 discrepancies" and looks like it works.
 
-So: match on `(company, title)` in Python, and accept that one company posting two
+So: match on `(company_canonical, title_canonical)`, and accept that one company posting two
 same-titled roles in two cities produces an `ambiguous` entry a human resolves once via
-`onenote_link_page`. Fail toward "ask", never toward "guess". This mirrors Part 1's own
-stance that a duplicate row (visible, correctable) beats a false merge (silent, destructive).
+`onenote_link_page`. Fail toward "ask", never toward "guess".
+
+**Use the persisted canonical columns.** The first draft matched in Python over a full
+`SELECT` of `jobs`, reasoning that adding `company_norm`/`title_norm` columns "would have
+coupled Part 2 to the very key-versioning hazard that Part 1's spec spends a page warning
+about." Part 1 shipped those columns anyway — `company_canonical` and `title_canonical`, both
+indexed — and documents the versioning hazard itself. The coupling already exists and is
+already paid for. So tier 3 is an indexed lookup, and tiers 4–5 scan only the rows sharing a
+canonical company:
+
+```sql
+SELECT id, title, title_canonical, status, date_applied
+  FROM jobs
+ WHERE company_canonical = ? AND merged_into IS NULL
+```
+
+This is both faster and *more correct* than the first draft: `canonicalize_company` collapses
+`Acme Corp` / `Acme Corporation` / `Acme, Inc.`, which `normalize_key_part` does not. A page
+saying "Acme Corp" against a job stored as "Acme, Inc." would have fallen through tier 3 to
+fuzzy for no reason at all.
 
 ### Where `extracted` comes from — two-tier extraction
 
@@ -971,7 +1230,7 @@ irreversible. It reports `proposed_action` and stops.
 
 ---
 
-### Tool 23: `onenote_ignore_page`
+### Tool 25: `onenote_ignore_page`
 
 **Purpose:** Mark a page as not-an-application, so reconciliation stops reporting it.
 
@@ -1029,8 +1288,8 @@ The design consequences, already baked in above:
 Non-negotiable, and worth a test each:
 
 1. `import job_tracker_mcp.server` with `JOB_TRACKER_MS_CLIENT_ID` unset, no network, and no
-   Keychain entry → **succeeds**, registers all 23 tools, writes nothing to stdout.
-2. All 13 Part-1 tools work identically with OneNote entirely unconfigured.
+   Keychain entry → **succeeds**, registers all 25 tools, writes nothing to stdout.
+2. All 15 Part-1 tools work identically with OneNote entirely unconfigured.
 3. Every OneNote tool, unconfigured, returns a `{"error": ...}` or a `{"configured": false}`
    diagnosis — never an exception, never a hang, never a network timeout that blocks the
    stdio loop for 30 seconds.
@@ -1051,11 +1310,29 @@ Zero network. Zero Keychain. Zero live notebook. Enforced, not merely intended:
 # tests/conftest.py -- ADD
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
-    """Any real socket in the test suite is a bug."""
+    """Any real socket in the test suite is a bug.
+
+    Blocks at the socket layer, NOT at httpx. The first draft patched
+    httpx.HTTPTransport.handle_request -- but msal talks over `requests`/urllib3,
+    so the entire auth path could have reached the internet while this fixture
+    reported success. Sockets are the one chokepoint both libraries share.
+    """
     def _boom(*a, **k):
         raise AssertionError("test attempted a real network connection")
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _boom)
+    monkeypatch.setattr(socket.socket, "connect", _boom)
+    monkeypatch.setattr(socket.socket, "connect_ex", _boom)
+    monkeypatch.setattr(socket, "create_connection", _boom)
+
+
+@pytest.fixture(autouse=True)
+def _no_keychain(monkeypatch):
+    """Never touch the real Keychain, and never block on its dialog."""
+    monkeypatch.setattr(keyring, "get_password", lambda *a, **k: None)
+    monkeypatch.setattr(keyring, "set_password", lambda *a, **k: None)
 ```
+
+`httpx.MockTransport` is injected explicitly and never opens a socket, so it sails through.
+Anything that *does* open one fails loudly, with a stack trace pointing at the culprit.
 
 Graph is faked with `httpx.MockTransport` and a handful of captured-shape JSON fixtures in
 `tests/fixtures/graph/`. Auth is faked by injecting `token_provider=lambda: "fake-token"`.
@@ -1080,10 +1357,19 @@ Graph is faked with `httpx.MockTransport` and a handful of captured-shape JSON f
   **byte-identical**, and the three new tables exist.
 - `test_fresh_db_is_v2` — new file gets both schemas and `user_version=2`.
 - `test_v3_database_refuses` — `user_version=3` still raises, per Part 1.
-- `test_link_cascade_on_job_delete` — deleting a job removes its `onenote_links` rows.
-  (Proves `PRAGMA foreign_keys=ON` is actually live.)
+- `test_link_cascade_on_page_delete` — deleting a page removes its `onenote_links` rows.
+  (Proves `PRAGMA foreign_keys=ON` is actually live. Note this is the cascade that fires;
+  the one into `jobs` never does, because Part 1 never deletes a job.)
 - `test_tombstone_not_delete` — a vanished page keeps its row and its links.
 - `test_content_cache_key` — content refetched iff `content_synced_dt != last_modified_dt`.
+- `test_merge_jobs_repoints_links` — link page→B, `merge_jobs(A, B)`, assert the link now
+  names A and no row references the hidden B.
+- `test_merge_jobs_link_collision` — a page linked to **both** A and B; after the merge exactly
+  one row survives (`PRIMARY KEY(page_id, job_id)` is not violated) and no evidence is lost.
+- `test_link_page_refuses_merged_job` — `onenote_link_page(page, B)` where B is merged returns
+  an error naming A.
+- `test_migration_is_idempotent` — run `_migrate(1, 2)`, then simulate the crash gap by
+  resetting `user_version` to 1, and run it again. No error; tables intact; version 2.
 
 **`test_onenote_client.py`** (all via `MockTransport`)
 - `test_resolve_section` — finds `Job Searching` under `Randy's Notebook`.
@@ -1107,6 +1393,22 @@ Graph is faked with `httpx.MockTransport` and a handful of captured-shape JSON f
 **`test_reconcile.py`** (pure, no DB, no HTTP — the important one)
 - `test_marker_match_wins` — a page with a marker links to that job even if the text names a
   different company.
+- `test_manual_beats_marker` — a page carrying a stale marker for job B, manually linked to
+  job A, reconciles to A. (Pins the tier-order reversal.)
+- `test_fuzzy_metric_is_word_overlap_not_characters` — the regression pin for the metric.
+  Assert `staff engineer` / `staff software engineer` matches while
+  `backend engineer` / `frontend engineer` does not. Under `SequenceMatcher` the second scores
+  *higher* than the first, so a test that only checks the true positive would pass with the
+  wrong metric. **Assert both directions.**
+- `test_default_min_confidence_matches_the_true_duplicate` — with the shipped default, the
+  `staff software engineer` page matches. Guards against a threshold that silently matches
+  nothing and reports "0 discrepancies."
+- `test_merged_jobs_are_not_match_candidates` — a merged job never appears in `onenote_only`,
+  `ambiguous`, or `matched`.
+- `test_manual_link_date_applied_is_used` — reconcile proposes `mark_applied` with the date
+  from the link row, **not** today's date.
+- `test_exact_match_uses_canonical_company` — a page saying `Acme Corp` matches a job stored as
+  `Acme, Inc.` at tier 3 (`exact`), not tier 4. Pins the `canonicalize_company` switch.
 - `test_exact_match_company_title` — normalization applies (`"Acme  Corp."` vs `"acme corp."`).
 - `test_location_is_not_part_of_the_key` — a job stored with `location="Remote, US"` matches a
   page that never mentions a location. **The regression test for the central design decision.**
@@ -1120,7 +1422,7 @@ Graph is faked with `httpx.MockTransport` and a handful of captured-shape JSON f
 - `test_table_extraction` — a pipe-table page yields structured `extracted` records.
 
 **`test_server_isolation.py`**
-- `test_import_without_client_id` — import succeeds, stdout empty, 23 tools registered.
+- `test_import_without_client_id` — import succeeds, stdout empty, 25 tools registered.
 - `test_part1_tools_unaffected` — `add_job`/`get_stats` behave identically with OneNote off.
 
 ---
@@ -1129,21 +1431,33 @@ Graph is faked with `httpx.MockTransport` and a handful of captured-shape JSON f
 
 Each milestone is independently verifiable. Do not proceed past a red one.
 
-| # | Milestone | Done when |
-|---|---|---|
-| 0 | Randy completes Phase 0; `JOB_TRACKER_MS_CLIENT_ID` is set | `echo $JOB_TRACKER_MS_CLIENT_ID` prints a GUID |
-| 1 | `pip install msal`; pin `msal`, `httpx`, `keyring` in `requirements.txt` | `pip show msal` |
-| 2 | Schema v2 + `store.py` + migration tests | `pytest tests/test_onenote_store.py` green; `cp data/jobs.db data/jobs.db.pre-v2` taken |
-| 3 | `htmlio.py` + tests (pure, no auth needed) | `pytest tests/test_onenote_htmlio.py` green |
-| 4 | `auth.py` + `onenote-auth.sh` | `./onenote-auth.sh` completes; `onenote_auth_status` reports `authenticated: true` |
-| 5 | `graph.py` + `client.py` + `MockTransport` tests | `pytest tests/test_onenote_client.py` green |
-| 6 | Tools 14, 15, 16, 17, 18, 19 (read path) | `onenote_sync` mirrors the real section; `onenote_list_pages` shows the real page titles |
-| 7 | `reconcile.py` + tools 21, 22, 23 | `reconcile_applications(dry_run=true)` produces a report a human agrees with |
-| 8 | Tool 20 `onenote_create_page` (write path) | preview → confirm → one page appears in OneNote; a second call returns `exists` |
-| 9 | Full suite + stdout-purity smoke tests + Claude Desktop config `env` block | all green; ⌘Q and relaunch |
+**Phase 0 does not block the start.** The first draft put the Entra app registration at
+milestone 0, gating everything. But milestones 1, 2, 3, and 5 need no client id, no token, and
+no network — `MockTransport` and a temp SQLite file cover them entirely. That is most of the
+code, fully tested, before Randy opens a browser. Phase 0 is a prerequisite of milestone 4,
+not of the project.
+
+| # | Milestone | Needs Phase 0? | Done when |
+|---|---|---|---|
+| 1 | `pip install msal`; pin `msal`, `httpx`, `keyring` in `requirements.txt` | no | `pip show msal` |
+| 2 | Schema v2, `store.py`, `merge_jobs` link re-pointing, migration tests | no | `pytest tests/test_onenote_store.py` green; `cp data/jobs.db data/jobs.db.pre-v2` taken |
+| 3 | `htmlio.py` + tests (pure) | no | `pytest tests/test_onenote_htmlio.py` green |
+| 5 | `graph.py` + `client.py` + `MockTransport` tests | no | `pytest tests/test_onenote_client.py` green |
+| 7a | `reconcile.py` pure functions + `test_reconcile.py` | no | green, incl. the location and metric regression pins |
+| — | *Randy completes Phase 0* | — | `echo $JOB_TRACKER_MS_CLIENT_ID` prints a GUID |
+| 4 | `auth.py` + `onenote-auth.sh` (incl. keychain timeout) | **yes** | `./onenote-auth.sh` completes; `onenote_auth_status` reports `authenticated: true` |
+| 6 | Tools 16–21 (read path) | **yes** | `onenote_sync` mirrors the real section; `onenote_list_pages` shows the real page titles |
+| 7b | Tools 23, 24, 25 wired to the DB | yes | `reconcile_applications(dry_run=true)` produces a report a human agrees with |
+| 8 | Tool 22 `onenote_create_page` (write path) | yes | preview → confirm → one page appears in OneNote; a second call returns `exists` |
+| 9 | Full suite + stdout-purity smoke tests + Claude Desktop config `env` block | yes | all green; ⌘Q and relaunch |
 
 **Milestone 6 before 8.** Read the section, look at the report, and confirm the extraction is
 right *before* granting anything the ability to write into a personal notebook.
+
+**Milestone 7a before 6.** `reconcile.py` is pure functions over data structures — no SQL, no
+HTTP. Its tests are the ones that catch the two design errors this document has already made
+once (hashing location into the key; using a character-similarity metric). Write them before
+anything can reach a live notebook and make a wrong report look authoritative.
 
 ---
 
@@ -1156,9 +1470,12 @@ httpx>=0.27,<1
 keyring>=25,<26
 ```
 
-`httpx` and `keyring` arrive transitively with `fastmcp` 3.4.4 today. **Declare them anyway.**
-Part 2 imports them directly, and a future `fastmcp` that drops either one would break this
-server with an `ImportError` at a moment nobody is looking at it.
+Measured on this machine (2026-07-09): `httpx 0.28.1` ✓ and `keyring 25.7.0` ✓ are already
+present, arriving transitively through `fastmcp` → **`fastmcp-slim`** (fastmcp's only direct
+requirement — so these are two levels down, which makes declaring them more important, not
+less). `msal` is **not** installed; it is the one genuinely new dependency. **Declare all
+three anyway.** Part 2 imports them directly, and a future `fastmcp` that drops one would
+break this server with an `ImportError` at a moment nobody is looking at it.
 
 `msal` is the only genuinely new dependency. It is Microsoft's own, is pure Python, and its
 only transitive deps are `requests`, `PyJWT`, and `cryptography`.
@@ -1295,3 +1612,72 @@ with an unfamiliar note fails silently and reports a wrong number, whereas a mod
 with the same note reads it correctly and writes a durable link. Building the regex first and
 the model path second would produce a tool that appears to work and quietly under-reports.
 Build Tier B first; add Tier A only once the real pages show a table worth optimizing for.
+
+---
+---
+
+# Gap Review — Third Pass (against shipped Part 1)
+
+The second pass reviewed this plan against itself. This one reviewed it against the Part 1 that
+actually shipped, and against the machine it will run on. Everything below is folded into the
+body above.
+
+**Two defects that would have produced a confidently wrong reconciler:**
+
+1. **Tier 4 specified `difflib.SequenceMatcher`.** Measured, that metric *inverts the answer*:
+   `staff engineer` / `senior staff engineer` (different level) scores **0.80**, above
+   `staff engineer` / `staff software engineer` (same requisition) at **0.76**. Part 1
+   encountered this exact bug, deleted the metric, and pinned the lesson. Part 2 now imports
+   Part 1's `_title_similarity`. Compounding it, `min_confidence=0.85` matched **nothing** on
+   either scale — the reconciler would have reported "0 discrepancies" and looked healthy.
+   That is finding #1 of the second pass, recurring in a different disguise: *a reconciler
+   that matches nothing is indistinguishable from one that has nothing to find.* Default is
+   now 0.6.
+
+2. **`onenote_sync` held the DB lock across every HTTP call.** "Steps 3–5 in one transaction,"
+   with content fetching as step 4. Part 1 serializes all database access on one `RLock` and
+   one connection, so a 40-page sync would have frozen every other tool for the length of 40
+   network round-trips. Restructured into read / network / write phases, with a test that
+   asserts the lock is free while a request is in flight.
+
+**Three things Part 1 shipped that this document predates:**
+
+3. **`merged_into`.** Jobs are never deleted; duplicates are merged and hidden. Links to a
+   merged job orphan silently, and `mark_applied` on one is refused. `merge_jobs` now
+   re-points `onenote_links`, and every reconciliation query filters `merged_into IS NULL`.
+
+4. **`canonicalize_company` / `canonicalize_title`.** Tier 3 used `normalize_key_part`, so a
+   page saying `Acme Corp` would miss a job stored as `Acme, Inc.` The canonical forms are
+   already persisted as indexed columns, which also retires this document's argument for
+   matching in Python.
+
+5. **Fifteen tools, not thirteen.** Part 2's tools are 16–25; the server ends at 25.
+
+**Three environmental facts, measured rather than assumed:**
+
+6. **`sqlite3.executescript()` commits any pending transaction before it runs.** The migration
+   is therefore *not* atomic. It is safe only because it is idempotent. Written down, because
+   the next migration may not be.
+
+7. **A Keychain "allow access" dialog blocks; it does not raise.** The token-cache fallback
+   was guarded by `except`, which such a dialog never triggers. In a stdio server with no TTY,
+   that is an unrecoverable hang. Now a timed read on a worker thread.
+
+8. **`msal` speaks `requests`, not `httpx`.** The `_no_network` fixture patched
+   `httpx.HTTPTransport`, leaving the entire auth path free to reach the internet during tests
+   while the fixture reported success. Now blocked at `socket.connect`.
+
+**Two smaller corrections:** `onenote_link_page` gained `date_applied`, without which Tier-B —
+the *primary* extraction path — would have recorded the reconciliation date as the application
+date, permanently. And `reconcile_applications` returns `matched` as an auditable list rather
+than a bare integer, because "28 matches, 0 discrepancies" is exactly what a broken reconciler
+also prints.
+
+**One reversal of judgment:** the ladder now ranks `manual` above `marker`. A marker is exact
+but can go stale — duplicate a page as a template, edit it, and the old `job-tracker-id` rides
+along in the body. A human who just read the page knows more than a string they forgot they
+copied.
+
+**One sequencing change:** Phase 0 (the Entra app registration) no longer gates the project.
+Milestones 1, 2, 3, 5, and the whole of `reconcile.py` need no client id, no token, and no
+network. Build and test those first; open a browser later.

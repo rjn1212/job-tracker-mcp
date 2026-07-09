@@ -22,9 +22,9 @@ chmod +x start.sh
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Requires Python 3.10+ (3.11+ for `StrEnum`; on 3.10 change `models.py` to use
-`class Status(str, Enum)`). Depends only on `fastmcp` 3.x — everything else is
-the standard library.
+Requires Python 3.11+ (for `StrEnum`; on 3.10 change `models.py` to use
+`class Status(str, Enum)`). Depends on `fastmcp` 3.x, plus `msal`, `httpx`, and
+`keyring` for the OneNote integration.
 
 ## Register with Claude Desktop
 
@@ -156,6 +156,91 @@ Changing them orphans every stored row. See the warning in `models.py`.
 
 Rejection patterns apply at insert time only — adding one never retroactively
 rejects jobs already in the database.
+
+## OneNote integration
+
+Ten more tools mirror the `Job Searching` section of a OneNote notebook into the
+same database and reconcile it against tracked jobs, answering one question:
+**which jobs have I already applied to?**
+
+| Tool | Purpose |
+|---|---|
+| `onenote_auth_status` | Diagnose the connection. Call this first when anything fails. |
+| `onenote_list_sections` | Enumerate notebooks and sections |
+| `onenote_sync` | Refresh the local mirror. The only tool needing network. |
+| `onenote_list_pages` / `onenote_get_page` / `onenote_search_pages` | Read the mirror |
+| `onenote_create_page` | Create a page. Dry-run by default, gated, idempotent. |
+| `onenote_link_page` / `onenote_ignore_page` | Curate what reconciliation sees |
+| `reconcile_applications` | Cross-reference jobs against pages |
+
+Everything but `onenote_sync` reads the local cache, so reconciliation never
+touches the network. Page content is refetched only when the page changed
+upstream: a steady-state sync is one HTTP request. OneNote's Graph endpoints are
+aggressively throttled, and `GET /pages/{id}/content` is the expensive call.
+
+### Setup
+
+Sign-in **cannot** happen inside the MCP server: it's a stdio process with no
+terminal, and its stdout carries the protocol. So auth is out-of-band.
+
+1. Register an app at <https://entra.microsoft.com>: public client, "any org
+   directory and personal Microsoft accounts", delegated **`Notes.ReadWrite`**
+   (not `.All`), **allow public client flows = Yes**. No client secret.
+2. Put the client id in the Claude Desktop config `env` block — Claude Desktop
+   does not read your shell profile.
+3. Run `./onenote-auth.sh` in a real terminal, once.
+
+```json
+"job-tracker": {
+  "command": "/Users/randyn/projects/git/job-tracker-mcp/start.sh",
+  "args": [],
+  "env": {
+    "JOB_TRACKER_MS_CLIENT_ID": "<guid>",
+    "JOB_TRACKER_ONENOTE_NOTEBOOK": "Randy's Notebook",
+    "JOB_TRACKER_ONENOTE_SECTION": "Job Searching",
+    "JOB_TRACKER_ONENOTE_WRITE": "0"
+  }
+}
+```
+
+Writing is **off by default**. Creating a page is the one irreversible thing this
+server can do — Graph has no undo, and there is no delete tool by design. Flip
+`JOB_TRACKER_ONENOTE_WRITE` to `"1"` only when you want it.
+
+**Rebuilding `.venv` requires re-running `onenote-auth.sh`.** The Keychain item is
+bound to the binary that created it; a new interpreter triggers an "allow access"
+dialog that a background process cannot answer. Token reads are time-boxed so
+that shows up as an error rather than a hang.
+
+### Reconciliation
+
+`reconcile_applications` partitions everything and, by default, changes nothing:
+
+- `matched` — both sources agree
+- `onenote_only` — the page says applied, the database doesn't
+- `db_only` — the database says applied, no page documents it
+- `ambiguous` — several jobs plausibly match; a human picks, once
+- `unmatched` — a page names a company the tracker has never seen
+- `unparsed_pages` — read them, then `onenote_link_page`
+
+Mutation is opt-in **twice**: `dry_run=false` *and* `apply_marks=true`. Ambiguous
+entries are never acted on, `db_only` never triggers bulk page creation, and
+`mark_applied` still enforces the status lifecycle — a rejected job lands in
+`skipped` rather than being quietly revived.
+
+Matching deliberately ignores location: a handwritten note says "Applied to Staff
+Engineer at Acme, 7/2" and never records where the job was. Hashing the Part 1 key
+would match nothing, and a reconciler that matches nothing reports zero
+discrepancies and looks like it works.
+
+Pages this server creates carry a visible `job-tracker-id:` footer. That marker,
+not the local link table, is the source of truth for which page documents which
+job — it survives a lost database, and it's why page creation is idempotent.
+
+> **After the first sync, `jobs.db` contains the text of your OneNote pages** —
+> possibly salary figures, recruiter names, and interview notes about named
+> people. It is gitignored and unencrypted. That is a real change in how sensitive
+> that file is.
 
 ## Development
 
