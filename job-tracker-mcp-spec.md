@@ -130,37 +130,45 @@ PRAGMA synchronous = NORMAL;    -- safe under WAL, much faster than FULL
 
 ```sql
 CREATE TABLE IF NOT EXISTS jobs (
-    id              TEXT PRIMARY KEY,         -- 16-hex-char SHA256 prefix of the normalized natural key
-    company         TEXT NOT NULL,
-    title           TEXT NOT NULL,
-    location        TEXT NOT NULL,            -- as written in the posting, for display
+    id                 TEXT PRIMARY KEY,      -- 16-hex-char SHA256 prefix of the canonical natural key
+    company            TEXT NOT NULL,         -- as written in the posting, for display
+    company_canonical  TEXT NOT NULL,         -- canonicalize_company(company); part of the id
+    title              TEXT NOT NULL,         -- as written in the posting, for display
+    title_canonical    TEXT NOT NULL,         -- canonicalize_title(title); part of the id
+    location           TEXT NOT NULL,         -- as written in the posting, for display
     location_canonical TEXT NOT NULL,         -- canonicalize_location(location); part of the id
-    url             TEXT,
-    source          TEXT,                     -- e.g. "LinkedIn", "Indeed", "Built In", "Dice"
-    date_seen       TEXT NOT NULL,            -- ISO 8601 local date first seen, e.g. "2026-07-09"
-    last_seen       TEXT NOT NULL,            -- ISO 8601 local date most recently seen in an alert
-    times_seen      INTEGER NOT NULL DEFAULT 1,
-    date_applied    TEXT,                     -- ISO 8601 date, NULL if not applied
-    status          TEXT NOT NULL DEFAULT 'new',
-    fit_score       INTEGER,                  -- 1-10, set by Claude during triage
-    notes           TEXT,
-    email_subject   TEXT,                     -- original email subject line for reference
-    created_at      TEXT NOT NULL,            -- ISO 8601 datetime with offset
-    updated_at      TEXT NOT NULL,            -- ISO 8601 datetime with offset
+    url                TEXT,
+    source             TEXT,                  -- e.g. "LinkedIn", "Indeed", "Built In", "Dice"
+    date_seen          TEXT NOT NULL,         -- ISO 8601 local date first seen, e.g. "2026-07-09"
+    last_seen          TEXT NOT NULL,         -- ISO 8601 local date most recently seen in an alert
+    times_seen         INTEGER NOT NULL DEFAULT 1,
+    date_applied       TEXT,                  -- ISO 8601 date, NULL if not applied
+    status             TEXT NOT NULL DEFAULT 'new',
+    fit_score          INTEGER,               -- 1-10, set by Claude during triage
+    notes              TEXT,
+    email_subject      TEXT,                  -- original email subject line for reference
+    merged_into        TEXT REFERENCES jobs(id),  -- non-NULL => this row is a hidden duplicate
+    created_at         TEXT NOT NULL,         -- ISO 8601 datetime with offset
+    updated_at         TEXT NOT NULL,         -- ISO 8601 datetime with offset
 
     CHECK (status IN ('new', 'applied', 'rejected', 'expired')),
     CHECK (fit_score IS NULL OR (fit_score BETWEEN 1 AND 10)),
     CHECK (times_seen >= 1),
     CHECK (status != 'applied' OR date_applied IS NOT NULL),
-    CHECK (length(location_canonical) > 0)
+    CHECK (length(location_canonical) > 0),
+    CHECK (merged_into IS NULL OR merged_into != id)
 );
 ```
 
-`location` preserves whatever the posting said (`"Remote, US"`), because that is what the user wants to read. `location_canonical` (`"remote"`) is what feeds the id. On a re-sighting the stored `location` is **not** overwritten — the first spelling seen wins, and by construction any later spelling that reaches the same row canonicalized to the same value anyway.
+Each field is stored twice: the raw string the posting used (`"Acme, Inc."`, `"Remote, US"`), because that is what the user wants to read, and the canonical form (`"acme"`, `"remote"`), which feeds the id. Persisting the canonical form is what lets a future migration tell which rule each row was keyed under.
+
+On a re-sighting the raw strings are **not** overwritten — the first spelling wins, and by construction any later spelling that reached the same row canonicalized identically anyway.
+
+`merged_into` implements duplicate resolution without deletion; see `merge_jobs`. Every listing query filters `merged_into IS NULL`.
 
 The `CHECK` constraints are the last line of defense. Validate in Python too, and return a clean error string rather than letting an `IntegrityError` surface — but keep the constraints so a bug cannot write nonsense.
 
-The last constraint reads "applied implies a date," deliberately **not** "a date implies applied." A job you applied to and that later expired keeps its `date_applied` as history; the transition to `expired` must not clear it.
+The `status != 'applied' OR date_applied IS NOT NULL` constraint reads "applied implies a date," deliberately **not** "a date implies applied." A job you applied to and that later expired keeps its `date_applied` as history; the transition to `expired` must not clear it.
 
 ### Table: `rejected_patterns`
 
@@ -188,7 +196,8 @@ The `UNIQUE` index prevents the same pattern from being added twice (once via `r
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_jobs_status     ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_jobs_company    ON jobs(company);
+CREATE INDEX IF NOT EXISTS idx_jobs_company    ON jobs(company_canonical);
+CREATE INDEX IF NOT EXISTS idx_jobs_merged     ON jobs(merged_into);
 CREATE INDEX IF NOT EXISTS idx_jobs_date_seen  ON jobs(date_seen);
 CREATE INDEX IF NOT EXISTS idx_jobs_source     ON jobs(source);
 CREATE INDEX IF NOT EXISTS idx_jobs_triage     ON jobs(status, fit_score DESC, date_seen DESC);
@@ -266,6 +275,33 @@ def normalize_key_part(value: str | None) -> str:
 
 `normalize_key_part` must tolerate `None` — `check_job` and `add_job` both call it with values that arrive from an LLM, and a missing `location` must not raise `AttributeError`.
 
+### Why the LLM must not generate the key
+
+Asking the model to emit a canonical company/title/location is the obvious design and it does not work. A usable key requires *cross-session determinism*: the model would have to see `Acme Corporation` today and independently reproduce the canonical string it invented for `Acme Corp` six weeks ago, with no memory of having done so. Sampling varies, model versions change, and every drift is a silent duplicate row.
+
+Canonicalization is therefore code, and deterministic. The model's role is **adjudication, not normalization** — it looks at two concrete rows and judges whether they are the same requisition (see `merge_jobs`), and that judgment is persisted so it is made once.
+
+### Company canonicalization
+
+Strip trailing legal-entity suffixes so `Acme Corp`, `Acme Corporation`, and `Acme, Inc.` are one employer. The suffix list is closed and boring: `inc, incorporated, llc, ltd, limited, corp, corporation, co, company, gmbh, plc, lp, llp, pllc, sa, nv, bv, ab, ag, as, oy, pty, pbc, srl, kk, holdings, group`.
+
+Only strip from the **tail**, repeatedly, and never to empty — a company legitimately named `Limited` must canonicalize to `limited`, and `Ag Solutions` must keep its `Ag`.
+
+This deliberately merges `Acme Corp` with `Acme LLC`. For a personal job tracker that is almost always correct; for real corporate entity resolution it would not be. Note that `Infosys BPM Ltd` → `infosys bpm` and `Infosys Limited` → `infosys` remain distinct, which is right — they are different subsidiaries.
+
+### Title canonicalization
+
+Job boards decorate titles. Strip only what is unambiguously not part of the role name:
+
+- bracketed req IDs — `[R-12345]`
+- parenthesized geography — `(Remote)`, `(US)` (detected by running the content through `canonicalize_location` and dropping it if the result is `remote` or `unknown`)
+- salary — anything matching `$\s*\d`, or a bare `180k-220k` pay range
+- trailing segments after a **whitespace-padded** separator (` - `, ` | `, ` — `) that are themselves noise by the rules above
+
+The whitespace padding is load-bearing: splitting on a bare `-` would destroy `Full-Stack Engineer` and `Front-end Developer`.
+
+Deliberately preserved, because each changes which job this is: `Senior`, `II`, `, Platform`, `(Contract)`. A normalizer that ate seniority would merge four different requisitions into one row.
+
 ### Location canonicalization
 
 Job boards render the same remote role as `Remote`, `Remote, US`, `United States (Remote)`, `100% Remote`, and `WFH`. These are one job and **must** produce one id. Canonicalization happens in code, not by asking the model to normalize — an instruction the model follows inconsistently, producing silent duplicate rows that no test catches.
@@ -333,8 +369,8 @@ def canonicalize_location(value: str | None) -> str:
 
 def generate_job_id(company: str, title: str, location: str | None) -> str:
     raw = "|".join((
-        normalize_key_part(company),
-        normalize_key_part(title),
+        canonicalize_company(company),
+        canonicalize_title(title),
         canonicalize_location(location),
     ))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -351,9 +387,10 @@ Worked examples, all of which the tests must assert:
 | `Fully Remote` | `remote` | |
 | `WFH` / `Work From Home` | `remote` | |
 | `Remote, Anywhere` | `remote` | |
+| `Remote in the US` | `remote` | |
 | `Remote - EMEA` | `remote emea` | **distinct** — restricted remote is a different job |
 | `Hybrid - Remote 2 days` | `hybrid remote 2 days` | **distinct** — not fully remote |
-| `Remote in Austin, TX` | `remote austin tx` | **distinct** — city-restricted |
+| `Remote in Austin, TX` | `remote in austin tx` | **distinct** — city-restricted |
 | `Austin, TX, USA` | `austin tx` | trailing country dropped |
 | `Austin, TX` | `austin tx` | collides with the above |
 | `` / `Unknown` / `N/A` | `unknown` | |
@@ -364,6 +401,21 @@ Two limitations kept deliberately, because fixing them means shipping a gazettee
 - `New York, NY` and `NYC` do not collide.
 
 Both fail toward a duplicate row, which is visible and correctable, rather than toward a false merge, which silently destroys a record.
+
+### Near-duplicates: detect, never auto-merge
+
+No hash can know that `Staff Engineer` and `Staff Software Engineer` are one requisition. `add_job` therefore creates the row **and** returns `possible_duplicates`: live jobs at the same canonical employer whose canonical titles overlap by at least `DUP_THRESHOLD` (0.6). Capped at 5 hints.
+
+Similarity is **Jaccard over word sets**, not character similarity. This is not a detail:
+
+| Pair | Character ratio | Word Jaccard | Truth |
+|---|---|---|---|
+| `staff engineer` / `staff software engineer` | 0.76 | **0.67** | same job |
+| `backend engineer` / `frontend engineer` | 0.79 | **0.33** | different jobs |
+
+A character-level metric ranks the different-role pair *above* the true duplicate, so no threshold can separate them. Characters measure spelling; word overlap measures meaning.
+
+The row is always created. Merging is the caller's explicit decision, via `merge_jobs`.
 
 ### The key is versioned
 
@@ -537,8 +589,10 @@ Apply `@_tool_guard` beneath `@mcp.tool()` on every tool. The `log.exception` ca
 ```json
 {
   "id": "a1b2c3d4e5f60718",
-  "company": "Acme Corp",
-  "title": "Staff Engineer",
+  "company": "Acme, Inc.",
+  "company_canonical": "acme",
+  "title": "Staff Engineer (Remote)",
+  "title_canonical": "staff engineer",
   "location": "Remote, US",
   "location_canonical": "remote",
   "url": "https://...",
@@ -551,6 +605,7 @@ Apply `@_tool_guard` beneath `@mcp.tool()` on every tool. The `log.exception` ca
   "fit_score": 8,
   "notes": null,
   "email_subject": "Your job alert for Staff Engineer",
+  "merged_into": null,
   "created_at": "2026-07-09T16:29:04-07:00",
   "updated_at": "2026-07-09T16:29:04-07:00"
 }
@@ -562,7 +617,7 @@ Produced by a single `models.row_to_job(row: sqlite3.Row) -> dict` helper. Never
 
 ## MCP Tools — Complete Specification
 
-Thirteen tools.
+Fifteen tools.
 
 ---
 
@@ -820,7 +875,37 @@ There is no distinct `mark_expired` tool; `update_job(id, status="expired")` is 
 
 ---
 
-### Tool 9: `get_rejected_patterns`
+### Tool 9: `merge_jobs`
+
+**Purpose:** Record that two rows are the same requisition. This is where the model's judgment becomes durable data.
+
+**Parameters:** `keep_id: str`, `duplicate_id: str`
+
+**Returns:** `{"result": "merged", "keep_id": ..., "duplicate_id": ..., "message": ...}`
+
+**Logic:**
+- Nothing is deleted. The duplicate keeps its row and gains `merged_into = keep_id`.
+- Merged rows are excluded from `get_jobs`, `search_jobs`, and `get_stats` (all filter `merged_into IS NULL`), but `get_job(id)` still returns them, so a stale id stays inspectable instead of 404ing.
+- A later `add_job` whose key resolves to the duplicate is redirected to the survivor (`_resolve` follows the pointer once).
+- Mutations against a merged row (`mark_applied`, `reject_job`, `update_job`) return an error naming the survivor.
+- The survivor absorbs: `date_seen = min`, `last_seen = max`, `times_seen = sum`, and `COALESCE` backfill of `url`, `source`, `fit_score`. Notes are appended with a `[merged from <id>]` marker.
+- **Never lose an application.** If the duplicate was `applied` and the survivor has no `date_applied`, the survivor adopts that status and date.
+- Refuse: merging a row into itself; merging into a row that is itself merged (would form a chain); merging an already-merged duplicate.
+- Anything previously merged into the duplicate is re-pointed at the survivor, so pointers are always one hop.
+
+### Tool 10: `unmerge_job`
+
+**Purpose:** Undo a merge.
+
+**Parameters:** `id: str` (the merged duplicate)
+
+**Returns:** `{"result": "unmerged", "id": ..., "message": ...}`
+
+The duplicate's own fields were never modified by the merge, so it comes back intact. The survivor keeps the `times_seen` and notes it absorbed — state it plainly in the response rather than implying a perfect inverse.
+
+---
+
+### Tool 11: `get_rejected_patterns`
 
 **Purpose:** Show all active rejection patterns, so the user and Claude both know what is being auto-filtered.
 
@@ -841,7 +926,7 @@ Ordered by `pattern_type`, then `pattern_value`. Values are returned in their st
 
 ---
 
-### Tool 10: `add_rejected_pattern`
+### Tool 12: `add_rejected_pattern`
 
 **Purpose:** Add a rejection pattern directly, not tied to rejecting a specific job.
 
@@ -863,7 +948,7 @@ Does not retroactively reject stored jobs.
 
 ---
 
-### Tool 11: `remove_rejected_pattern`
+### Tool 13: `remove_rejected_pattern`
 
 **Purpose:** Remove a rejection pattern (e.g. a company previously rejected but now worth reconsidering).
 
@@ -880,7 +965,7 @@ Removing a pattern does not un-reject jobs that were auto-rejected by it. Those 
 
 ---
 
-### Tool 12: `get_stats`
+### Tool 14: `get_stats`
 
 **Purpose:** Summary statistics for dashboard-style reporting.
 
@@ -907,7 +992,7 @@ Removing a pattern does not un-reject jobs that were auto-rejected by it. Those 
 
 ---
 
-### Tool 13: `search_jobs`
+### Tool 15: `search_jobs`
 
 **Purpose:** Substring search across `company`, `title`, `notes`, and `email_subject`.
 
@@ -948,9 +1033,10 @@ class PatternType(StrEnum):
 ALLOWED_TRANSITIONS: dict[str, set[str]] = { ... }   # as specified above
 
 JOB_FIELDS = (
-    "id", "company", "title", "location", "location_canonical", "url", "source",
+    "id", "company", "company_canonical", "title", "title_canonical",
+    "location", "location_canonical", "url", "source",
     "date_seen", "last_seen", "times_seen", "date_applied",
-    "status", "fit_score", "notes", "email_subject",
+    "status", "fit_score", "notes", "email_subject", "merged_into",
     "created_at", "updated_at",
 )
 
@@ -1123,20 +1209,33 @@ MCP server logs are at `~/Library/Logs/Claude/mcp-server-job-tracker.log`. That 
    rm -f /tmp/jt_smoke.db*
    ```
 
-9. **Smoke test the MCP layer** by listing tools without attaching a client, confirming all 13 registered and that importing `server` writes nothing to stdout:
+9. **Smoke test the MCP layer.** Confirm all 15 tools register with descriptions, and that importing `server` writes nothing to stdout:
 
    ```bash
    .venv/bin/python -c "
-   import io, contextlib, sys
+   import asyncio, contextlib, io, sys
    buf = io.StringIO()
    with contextlib.redirect_stdout(buf):
        from job_tracker_mcp import server
    assert buf.getvalue() == '', f'server import polluted stdout: {buf.getvalue()!r}'
-   print(len(server.mcp._tool_manager._tools), 'tools registered', file=sys.stderr)
-   " 
+   tools = asyncio.run(server.mcp.list_tools())
+   assert all(t.description for t in tools)
+   print(len(tools), 'tools registered', file=sys.stderr)
+   "
    ```
 
-   (The private `_tool_manager` attribute may move between fastmcp versions. If it does, fall back to `asyncio.run(server.mcp.get_tools())`. The stdout-purity assertion is the part that matters and must not be skipped.)
+   `list_tools()` is the public async enumeration API in fastmcp 3.x. There is no `_tool_manager` attribute, and `get_tools()` does not exist — verified against 3.4.4.
+
+   Then prove stdout purity of the **real** process, which is the thing that actually matters. FastMCP prints a startup banner; confirm it goes to stderr:
+
+   ```bash
+   .venv/bin/python -m job_tracker_mcp.server </dev/null 1>/tmp/out 2>/tmp/err
+   [ ! -s /tmp/out ] || { echo "FATAL: server wrote to stdout"; exit 1; }
+   ```
+
+   The server reads EOF on stdin and exits cleanly. `stdout` must be exactly zero bytes.
+
+   Finally, drive it as a real MCP client over stdio, exactly as Claude Desktop does — `fastmcp.client.transports.StdioTransport(command="<abs>/start.sh", args=[])`. Note that `Client("./start.sh")` does **not** work: transport inference rejects a `.sh` path, so the transport must be constructed explicitly.
 10. Back up the Claude Desktop config (`cp claude_desktop_config.json claude_desktop_config.json.bak`), merge the `job-tracker` entry with `json.load`/`json.dump` (never a hand-edited string), and re-parse the result to confirm it is valid JSON before writing.
 11. Report the final config and tell Randy to ⌘Q and relaunch Claude Desktop.
 
@@ -1224,5 +1323,5 @@ Must cover, briefly: what the server does, the two-MCP workflow with `apple-mail
 - All tools return JSON-serializable dicts. Never return a `sqlite3.Row`.
 - The database file is the only durable state. It has no backup story. Mention this in the README; a periodic `cp data/jobs.db data/jobs.db.bak` is the user's call, not this server's job.
 - Effort belongs in `database.py`. `server.py` is a thin adapter and `models.py` is nearly empty. The tests target `database.py` directly, without an MCP client in the loop.
-- When finished, report to stderr/console: the resolved Python and fastmcp versions, the 13 registered tool names, the passing test count, and the final Claude Desktop config.
+- When finished, report to stderr/console: the resolved Python and fastmcp versions, the 15 registered tool names, the passing test count, and the final Claude Desktop config.
 ```
