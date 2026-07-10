@@ -230,6 +230,34 @@ def test_triage_prompt_pins_the_things_that_go_wrong():
     assert "possible_duplicates" in body
 
 
+def test_triage_prompt_names_the_real_servers_and_tools():
+    """The apple-mail build is restricted to one account and mailbox.
+
+    Omitting either yields 'access restricted', so the prompt must supply both.
+    """
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    assert "`apple-mail`" in body and "`job-tracker`" in body
+    assert "RandyN Exchange" in body and "Job_Alerts_Viewed" in body
+    for tool in ("search_messages", "get_message", "bulk_add_jobs"):
+        assert tool in body
+
+
+def test_triage_prompt_warns_off_the_broken_date_field():
+    """date_sent is 0001-01-01T00:00:00Z in this mailbox; date_received is real."""
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    assert "date_received" in body
+    assert "NEVER `date_sent`" in body
+    assert "0001-01-01" in body                  # names the value it would produce
+
+
+def test_triage_prompt_accepts_a_different_mailbox():
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts(account="Other", mailbox="INBOX")
+    assert 'account = "Other"' in body and 'mailbox = "INBOX"' in body
+
+
 def test_filter_prompt_explains_the_three_pattern_types():
     from job_tracker_mcp.server import setup_job_filters
     body = setup_job_filters()

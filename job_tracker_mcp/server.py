@@ -524,25 +524,53 @@ def reconcile_applications(dry_run: bool = True, min_confidence: float = 0.6,
 
 
 @mcp.prompt
-def triage_job_alerts(since: str = "", max_emails: int = 25) -> str:
+def triage_job_alerts(
+    since: str = "",
+    max_emails: int = 25,
+    account: str = "RandyN Exchange",
+    mailbox: str = "Job_Alerts_Viewed",
+) -> str:
     """The standard job-alert triage run. Use this every time, unchanged.
 
-    Reads job alert emails via apple-mail-mcp, files every posting through
-    job-tracker, and reports what needs a human.
+    Reads job alert emails via the `apple-mail` server, files every posting
+    through this `job-tracker` server, and reports what needs a human.
     """
-    window = f"received on or after {since}" if since else "from the last 7 days"
+    window = (f"Keep only messages whose date_received is on or after {since}."
+              if since else
+              "Keep only messages whose date_received is within the last 7 days.")
     return f"""\
 Triage my job alert emails. Follow these steps in order. Do not improvise.
 
+Two MCP servers are involved, by these exact names:
+  - `apple-mail`   : reads Apple Mail. Tools: list_mailboxes, search_messages,
+                     get_message, get_attachments.
+  - `job-tracker`  : this server. Everything else below.
+
 STEP 1 — Find the alerts.
-Use apple-mail-mcp to list job alert emails {window} (at most {max_emails}).
-These come from LinkedIn, Indeed, Built In, Dice, Glassdoor and similar. For
-each email note its DATE and its SUBJECT -- you will need both.
+Call `apple-mail` search_messages with EXACTLY:
+    account = "{account}"
+    mailbox = "{mailbox}"
+    limit   = {max_emails}
+Both `account` and `mailbox` are mandatory -- that build is restricted to this
+one mailbox and will return an "access restricted" error for any other.
+
+search_messages has NO date filter. It returns
+{{account, mailbox, count, messages[]}}, where each message has:
+    id, subject, sender, date_received, date_sent, read_status, flagged
+
+{window} Filter in your head, after the call.
+
+USE `date_received`, NEVER `date_sent`. date_sent is unset in this mailbox and
+comes back as "0001-01-01T00:00:00Z". date_received looks like
+"2026-07-09T17:33:43-05:00" -- it already carries the local offset, so its first
+ten characters are the local calendar date. Take that YYYY-MM-DD directly; do
+not convert it.
 
 STEP 2 — Extract postings, one email at a time.
-For each email, read it and extract every job posting it advertises. For each,
-capture: company, title, location, url (if present), and the source (the board
-that sent the alert).
+For each surviving message, call `apple-mail` get_message(message_id=<its id>,
+include_content=true) and extract every job posting it advertises. For each,
+capture: company, title, location, url (if present), and the source (the job
+board that sent the alert -- infer it from the sender).
 
 Copy the strings VERBATIM. Do not tidy them. "Acme, Inc." stays "Acme, Inc.";
 "Staff Engineer (Remote) [R-1234]" keeps its decorations; "Remote, US" stays as
@@ -550,10 +578,12 @@ written. The server canonicalizes all three itself, deterministically, and
 hand-normalizing destroys information without improving the dedup.
 
 STEP 3 — File them.
-Call bulk_add_jobs ONCE PER EMAIL, with:
-  - date_seen  = that email's date, in YYYY-MM-DD. NOT today's date.
-                 This records when the posting first appeared.
-  - email_subject = that email's subject line.
+Call `job-tracker` bulk_add_jobs ONCE PER EMAIL, with:
+  - date_seen  = that message's date_received[:10], in YYYY-MM-DD.
+                 NOT today's date. This records when the posting first appeared,
+                 and the server keeps the earliest across re-sightings, so it is
+                 safe to process emails out of order.
+  - email_subject = that message's subject line.
   - source     = the job board.
 Never pass more than 100 postings in one call.
 
@@ -599,6 +629,8 @@ def setup_job_filters() -> str:
     """
     return """\
 Help me define my job-alert filters, then install them.
+
+All tools below are on the `job-tracker` MCP server.
 
 HOW FILTERS WORK (read this before proposing any).
 

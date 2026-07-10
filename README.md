@@ -250,8 +250,23 @@ Claude Desktop they appear under the server's attachment menu.
 
 | Prompt | When |
 |---|---|
-| `triage_job_alerts(since, max_emails)` | every alert-triage run |
+| `triage_job_alerts(since, max_emails, account, mailbox)` | every alert-triage run |
 | `setup_job_filters()` | once, and whenever a filter is wrong |
+
+The triage prompt names both servers explicitly — `apple-mail` and `job-tracker`,
+the keys in `claude_desktop_config.json` — because the model has to know which
+tool lives where. Two things about the mail side are baked in, having been
+verified against the running server rather than assumed:
+
+- **`search_messages` requires `account`, and this build is restricted** to
+  mailbox `Job_Alerts_Viewed` on account `RandyN Exchange`. Anything else returns
+  `access restricted`. Both are prompt arguments, so they can be changed without
+  editing code.
+- **`date_sent` is unset** in that mailbox — it comes back as
+  `0001-01-01T00:00:00Z`. The real field is `date_received`, which already carries
+  a local UTC offset, so its first ten characters *are* the local calendar date.
+  `search_messages` has no date filter at all, so `since` is applied after the
+  call.
 
 The division of labour matters more than the prompt text:
 
