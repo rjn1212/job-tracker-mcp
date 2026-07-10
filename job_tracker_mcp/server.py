@@ -623,7 +623,7 @@ def reconcile_applications(dry_run: bool = True, min_confidence: float = 0.6,
 @mcp.prompt
 def triage_job_alerts(
     since: str = "",
-    max_emails: int = 25,
+    batch_size: int = 20,
     account: str = "RandyN Exchange",
     mailbox: str = "Job_Alerts_Viewed",
 ) -> str:
@@ -631,6 +631,10 @@ def triage_job_alerts(
 
     Reads job alert emails via the `apple-mail` server, files every posting
     through this `job-tracker` server, and reports what needs a human.
+
+    Resumable: it processes `batch_size` emails per run, oldest first, starting
+    from where the last run stopped. Run it repeatedly until it reports that no
+    messages remain.
     """
     override = (f"\n    The user overrode the watermark: use since = {since} instead of\n"
                 f"    last_message_dt, but STILL record the run at the end.\n"
@@ -655,29 +659,37 @@ Inclusive is deliberate. Re-reading the boundary email is free, because add_job
 is idempotent and a re-sighting keeps the earliest date_seen. A gap is not free:
 it silently loses a job. When in doubt, overlap.
 {override}
-STEP 1 — Fetch the alerts.
+STEP 1 — Fetch the alerts, then sort and batch them YOURSELF.
 Call `apple-mail` search_messages with EXACTLY:
     account = "{account}"
     mailbox = "{mailbox}"
-    limit   = {max_emails}
+    limit   = 1000
 Both `account` and `mailbox` are mandatory -- that build is restricted to this
-one mailbox and returns "access restricted" for any other. `limit` may go up to
-1000; raise it for the first full pass.
+one mailbox and returns "access restricted" for any other. This call returns
+metadata only and is cheap, even for the whole mailbox.
 
-search_messages has NO date filter. It returns
+search_messages has NO date filter and NO ordering guarantee. It returns
 {{account, mailbox, count, messages[]}}, where each message has:
     id, subject, sender, date_received, date_sent, read_status, flagged
 
-Apply the STEP 0 cutoff yourself, after the call.
+So YOU must:
+  1. Discard the SKIP senders (below).
+  2. Discard anything before the STEP 0 cutoff.
+  3. SORT what remains by date_received, OLDEST FIRST.
+  4. Take the first {batch_size} of them. That is this run's batch.
+
+Oldest first, always. The watermark advances to the newest message you
+processed, so working newest-first would jump the watermark past mail you never
+read, and nothing would ever go back for it.
+
+If more messages remain after your batch, say so plainly at the end and tell me
+to run this prompt again. Do not try to process hundreds of emails in one pass.
 
 USE `date_received`, NEVER `date_sent`. date_sent is unset in this mailbox and
 comes back as "0001-01-01T00:00:00Z". date_received looks like
 "2026-07-09T17:33:43-05:00" -- it already carries the local offset, so its first
 ten characters are the local calendar date. Take that YYYY-MM-DD directly; do
 not convert it.
-
-If `count` equals your `limit`, there may be more mail than you fetched. Say so
-rather than assuming you saw everything.
 
 STEP 2 — Extract postings, one email at a time.
 For each surviving message, call `apple-mail` get_message(message_id=<its id>,
@@ -808,8 +820,10 @@ STEP 7 — Record where you stopped. Do this LAST.
 Call `job-tracker` record_triage_run with:
     account          = "{account}"
     mailbox          = "{mailbox}"
-    last_message_dt  = the date_received of the NEWEST message you actually
-                       processed, copied verbatim, offset and all.
+    last_message_dt  = the date_received of the NEWEST message IN THIS BATCH
+                       that you actually processed, copied verbatim, offset and
+                       all. Because you worked oldest-first, that is the last
+                       one you handled.
     emails_processed = how many you read
     postings_seen    = how many postings you filed
 

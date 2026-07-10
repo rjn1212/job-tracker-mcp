@@ -348,3 +348,15 @@ def test_triage_prompt_covers_the_new_senders():
     assert "PRECEDES the title" in body        # match.indeed's work-type line
     assert "NO company and NO location" in body  # Oracle's bare title list
     assert "times_seen=2" in body              # honest about the Oracle collapse
+
+
+def test_triage_prompt_batches_oldest_first():
+    """search_messages has no ordering guarantee, so a limit=N fetch is not
+    'the oldest N'. Working newest-first would jump the watermark past unread mail."""
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts(batch_size=20)
+    assert "OLDEST FIRST" in body
+    assert "limit   = 1000" in body               # fetch all metadata, cheap
+    assert "NO ordering guarantee" in body
+    assert "Take the first 20" in body
+    assert "run this prompt again" in body        # resumable by design
