@@ -242,6 +242,66 @@ job — it survives a lost database, and it's why page creation is idempotent.
 > people. It is gitignored and unencrypted. That is a real change in how sensitive
 > that file is.
 
+## The triage workflow
+
+Two MCP **prompts** are served by this server. They are the canonical workflow,
+versioned alongside the tools they call, so they cannot drift out of sync. In
+Claude Desktop they appear under the server's attachment menu.
+
+| Prompt | When |
+|---|---|
+| `triage_job_alerts(since, max_emails)` | every alert-triage run |
+| `setup_job_filters()` | once, and whenever a filter is wrong |
+
+The division of labour matters more than the prompt text:
+
+- **Determinism lives in code and data.** Deduplication is the id hash. Filters
+  are rows in `rejected_patterns`, consulted by `add_job` on every insert. The
+  status lifecycle is a transition table. A prompt cannot *guarantee* any of
+  these — it can only usually remember them.
+- **Judgment lives in the model.** Fit scores, whether two similar titles are
+  one requisition, reading an unstructured page.
+
+### Filters
+
+A filter is a row in `rejected_patterns`, of exactly one of three kinds:
+
+| kind | match | example |
+|---|---|---|
+| `company` | substring, against the **canonical** company | `infosys` catches `Infosys BPM Ltd` |
+| `title_keyword` | substring, against the **canonical** title | `staffing` catches `Staffing Coordinator` |
+| `source` | **exact**, case-insensitive | `dice` catches `Dice`, not `Dice Inc` |
+
+Company names have already had `Inc`/`LLC`/`Corp` stripped, and titles have lost
+`(Remote)`, salary ranges and req ids — but **not** seniority. Don't include
+those in a pattern.
+
+A filtered job is **still stored**, with `status="rejected"` and a note naming
+the pattern that fired. Deliberately:
+
+- **Dedup** — the same posting arrives in next week's alert. A stored rejection
+  means you decide once, not weekly.
+- **Audit** — you can see what the filter ate, which is the only way to notice
+  it's too broad.
+- **Reversal** — `remove_rejected_pattern`, then `update_job(id, status="new")`.
+
+A silently discarded job is the one thing that cannot be undone.
+
+Substrings bite: `eng` matches `Engineering`, `ai` matches `Air` and `Maintain`.
+Before installing a pattern, run `search_jobs(query="<pattern>")` and read what
+it would have caught. A pattern that catches a job you applied to is a bad one.
+
+Patterns apply at **insert time only** — adding one never retroactively rejects
+what's already tracked.
+
+### When a job first appeared
+
+`date_seen` is the date the posting first showed up, and it must come from the
+**alert email's date**, not from when triage happened to run. Pass it to
+`add_job`/`bulk_add_jobs`. On a re-sighting the server keeps the *earliest*
+`date_seen` and the *latest* `last_seen`, so emails can be processed in any
+order — including a backlog replayed out of sequence.
+
 ## Development
 
 `database.py` holds all the logic and all the tests point at it directly, with

@@ -86,12 +86,20 @@ def add_job(
     fit_score: int | None = None,
     notes: str | None = None,
     email_subject: str | None = None,
+    date_seen: str | None = None,
 ) -> dict:
     """Add a job posting to the tracker.
 
     Idempotent: adding the same (company, title, location) twice records a
     re-sighting rather than a second row, and never overwrites an existing
     fit_score, status, or notes.
+
+    ALWAYS pass `date_seen` (ISO YYYY-MM-DD) as the date of the alert email the
+    posting came from -- NOT today. It records when the job first appeared. If
+    you omit it, importing a backlog of three weeks of emails stamps every job
+    with today's date and the history is lost. On a re-sighting the server keeps
+    the EARLIEST date_seen and the LATEST last_seen, so emails may be processed
+    in any order.
 
     Pass company, title and location EXACTLY as the posting writes them --
     "Acme, Inc.", "Staff Engineer (Remote) [R-12345]", "Remote, US". Do NOT
@@ -109,7 +117,8 @@ def add_job(
 
     For a job alert email containing several postings, prefer bulk_add_jobs.
     """
-    return db.add_job(company, title, location, url, source, fit_score, notes, email_subject)
+    return db.add_job(company, title, location, url, source, fit_score, notes,
+                      email_subject, date_seen)
 
 
 @mcp.tool
@@ -119,6 +128,9 @@ def bulk_add_jobs(jobs: list[dict]) -> dict:
 
     `jobs` is a list of objects with the same keys as add_job's parameters
     (company, title, location required). At most 100 per call.
+
+    Set `date_seen` on every entry to the alert email's date, not today. One
+    call per email keeps that simple.
 
     Malformed entries do not abort the batch; each contributes an error to the
     per-entry `results` list, which preserves input order. Returns counts of
@@ -495,6 +507,152 @@ def reconcile_applications(dry_run: bool = True, min_confidence: float = 0.6,
     Status transitions are still enforced: a rejected job lands in `skipped`.
     """
     return _onenote().reconcile(dry_run, min_confidence, apply_marks, limit)
+
+
+# ---------------------------------------------------------------------------
+# MCP prompts.
+#
+# The workflow lives here rather than in a pasted chat message or a CLAUDE.md,
+# for one reason: a prompt served by the server ships with the tools it calls,
+# in the same commit, and cannot drift out of sync with them. Claude Desktop
+# and Claude Code both read it from the server.
+#
+# What must be IDENTICAL every run belongs in code, not in this text:
+# dedup (the id hash), filters (rejected_patterns), the status lifecycle.
+# A prompt cannot guarantee those -- it can only usually remember them.
+# ---------------------------------------------------------------------------
+
+
+@mcp.prompt
+def triage_job_alerts(since: str = "", max_emails: int = 25) -> str:
+    """The standard job-alert triage run. Use this every time, unchanged.
+
+    Reads job alert emails via apple-mail-mcp, files every posting through
+    job-tracker, and reports what needs a human.
+    """
+    window = f"received on or after {since}" if since else "from the last 7 days"
+    return f"""\
+Triage my job alert emails. Follow these steps in order. Do not improvise.
+
+STEP 1 — Find the alerts.
+Use apple-mail-mcp to list job alert emails {window} (at most {max_emails}).
+These come from LinkedIn, Indeed, Built In, Dice, Glassdoor and similar. For
+each email note its DATE and its SUBJECT -- you will need both.
+
+STEP 2 — Extract postings, one email at a time.
+For each email, read it and extract every job posting it advertises. For each,
+capture: company, title, location, url (if present), and the source (the board
+that sent the alert).
+
+Copy the strings VERBATIM. Do not tidy them. "Acme, Inc." stays "Acme, Inc.";
+"Staff Engineer (Remote) [R-1234]" keeps its decorations; "Remote, US" stays as
+written. The server canonicalizes all three itself, deterministically, and
+hand-normalizing destroys information without improving the dedup.
+
+STEP 3 — File them.
+Call bulk_add_jobs ONCE PER EMAIL, with:
+  - date_seen  = that email's date, in YYYY-MM-DD. NOT today's date.
+                 This records when the posting first appeared.
+  - email_subject = that email's subject line.
+  - source     = the job board.
+Never pass more than 100 postings in one call.
+
+STEP 4 — Read the response. Do not skip this.
+  - created        : new jobs, now status="new", awaiting a fit score.
+  - duplicates     : already tracked. The server kept the earliest date_seen.
+                     Nothing to do.
+  - auto_rejected  : matched one of my rejection patterns. Already stored as
+                     status="rejected". Do NOT re-add or argue with them; just
+                     tell me how many and which patterns fired.
+  - errors         : report them verbatim.
+  - possible_duplicates : a similar title at the same company. The job WAS
+                     created. Look at each pair and decide whether they are the
+                     same requisition. If they are, call merge_jobs(keep_id,
+                     duplicate_id), keeping the older row. If unsure, leave both
+                     and tell me.
+
+STEP 5 — Score the new ones.
+Call get_jobs(status="new") and set a fit_score of 1-10 on each via
+update_job(id, fit_score=N). Score against my actual background; be honest
+rather than generous. Unscored jobs sort last, so an unscored backlog is
+invisible -- get_stats().unscored_new tells you how many remain.
+
+STEP 6 — Report, in prose, in this order:
+  1. How many emails, how many postings.
+  2. What is worth my attention: new jobs with fit_score >= 7, newest first.
+  3. What was auto-rejected, and by which pattern. If a pattern is catching
+     things it should not, say so.
+  4. Any possible_duplicates you did not resolve, and why.
+  5. get_stats(): the total, the by_status counts, and unscored_new.
+
+Never call mark_applied. Applying is something I do, and I will tell you.
+Never call add_rejected_pattern on your own initiative. Suggest it; I decide.
+"""
+
+
+@mcp.prompt
+def setup_job_filters() -> str:
+    """Help me define the auto-rejection filters, then install them.
+
+    Run this once, and again whenever a filter is wrong. Filters are DATA in
+    the database, not instructions -- so they cannot be forgotten mid-run.
+    """
+    return """\
+Help me define my job-alert filters, then install them.
+
+HOW FILTERS WORK (read this before proposing any).
+
+A filter is a row in `rejected_patterns`. There are exactly three kinds:
+
+  company        substring match against the canonicalized company name.
+                 "infosys" matches "Infosys BPM Ltd" and "Infosys, Inc."
+                 Legal suffixes (Inc, LLC, Ltd, Corp) are already stripped, so
+                 do not include them in the pattern.
+
+  title_keyword  substring match against the canonicalized job title.
+                 "staffing" matches "Staffing Coordinator".
+                 The title has already had "(Remote)", salary ranges and req
+                 ids stripped -- but NOT seniority. "Senior" and "II" survive.
+
+  source         EXACT match against the job board name, case-insensitive.
+                 "dice" matches source "Dice" but NOT "Dice Inc". Exact, because
+                 sources come from a small closed set and substring matching
+                 there would surprise.
+
+Matching is case-insensitive. Patterns are checked at INSERT time only: adding
+a pattern never retroactively rejects jobs already in the database.
+
+A matching job is STILL STORED, with status="rejected" and a note recording
+which pattern fired. It is not discarded. This is deliberate:
+  - dedup: the same posting arrives in next week's alert; a stored rejection
+    means you decide once, not every week.
+  - audit: you can see what the filter ate, which is the only way to notice a
+    filter is too broad.
+  - reversal: remove_rejected_pattern, then update_job(id, status="new").
+A silently discarded job is the one thing that cannot be undone.
+
+BE CAREFUL WITH SUBSTRINGS. "eng" matches "Engineering". "ai" matches "Air",
+"Maintain", and "Detail". Prefer whole words. Test a candidate pattern against
+what is already tracked before installing it:
+    search_jobs(query="<pattern>")
+and read what comes back. If it catches something you want, do not install it.
+
+WHAT TO DO NOW.
+
+1. Ask me what I want filtered. Probe for: staffing agencies and body shops by
+   name; title keywords that mean "not for me" (contract, clearance, junior,
+   intern); job boards I do not trust.
+2. For each candidate, run search_jobs against my existing 28 jobs and show me
+   what it would have caught. A pattern that catches a job I applied to is a
+   bad pattern.
+3. Show me the final list and WAIT for me to approve it.
+4. Only then call add_rejected_pattern(pattern_type, pattern_value, reason) for
+   each. Always give a reason -- in six months it is the only thing that
+   explains why a company is invisible.
+5. Finish with get_rejected_patterns() so I can see exactly what is installed.
+
+Do not install anything I have not explicitly approved.
+"""
 
 
 if __name__ == "__main__":

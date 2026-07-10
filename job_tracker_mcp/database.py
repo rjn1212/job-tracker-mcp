@@ -353,6 +353,13 @@ class Database:
         if msg := self._bad_fit_score(fit_score):
             return {"result": "error", "message": msg}
 
+        # When the posting appeared, NOT when triage happened. Importing three
+        # weeks of alert emails must not stamp every job with today's date.
+        seen = entry.get("date_seen")
+        if seen is not None and (msg := self._bad_date(seen)):
+            return {"result": "error", "message": msg}
+        seen = seen or today_str()
+
         url = entry.get("url")
         source = entry.get("source")
         notes = entry.get("notes")
@@ -368,10 +375,17 @@ class Database:
         if row is not None:
             # Backfill nulls only. A re-sighting must never clobber a triage
             # decision (status, fit_score, notes) or the display strings.
+            #
+            # "First appeared" must never move forward, and "last seen" must
+            # never move backward -- alert emails do not arrive in date order,
+            # and a backlog import replays them in whatever order you read them.
+            first = min(row["date_seen"], seen)
+            last = max(row["last_seen"], seen)
             cur.execute(
-                "UPDATE jobs SET last_seen = ?, times_seen = times_seen + 1, "
-                "url = ?, source = ?, updated_at = ? WHERE id = ?",
-                (today, row["url"] or url, row["source"] or source, now, row["id"]),
+                "UPDATE jobs SET date_seen = ?, last_seen = ?, "
+                "times_seen = times_seen + 1, url = ?, source = ?, updated_at = ? "
+                "WHERE id = ?",
+                (first, last, row["url"] or url, row["source"] or source, now, row["id"]),
             )
             return {
                 "result": "duplicate",
@@ -379,7 +393,7 @@ class Database:
                 "company": company,
                 "title": title,
                 "status": row["status"],
-                "date_seen": row["date_seen"],
+                "date_seen": first,
                 "date_applied": row["date_applied"],
                 "times_seen": row["times_seen"] + 1,
                 "message": f"Already tracked: {row['title']} at {row['company']}",
@@ -398,7 +412,7 @@ class Database:
             "merged_into, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, NULL, ?, ?)",
             (job_id, company, c_canon, title, t_canon, location, l_canon, url, source,
-             today, today, status, fit_score, notes, email_subject, now, now),
+             seen, seen, status, fit_score, notes, email_subject, now, now),
         )
         result = {
             "result": "created",
@@ -429,11 +443,12 @@ class Database:
         fit_score: int | None = None,
         notes: str | None = None,
         email_subject: str | None = None,
+        date_seen: str | None = None,
     ) -> dict:
         entry = dict(
             company=company, title=title, location=location, url=url,
             source=source, fit_score=fit_score, notes=notes,
-            email_subject=email_subject,
+            email_subject=email_subject, date_seen=date_seen,
         )
         with self._lock, self.conn:
             cur = self.conn.cursor()

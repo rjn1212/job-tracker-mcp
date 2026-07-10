@@ -191,3 +191,49 @@ def test_stdout_purity_of_onenote_imports():
         import job_tracker_mcp.onenote.graph  # noqa: F401
         import job_tracker_mcp.onenote.service  # noqa: F401
     assert buf.getvalue() == ""
+
+
+# ------------------------------------------------------------------ prompts
+
+def test_prompts_are_registered_and_documented():
+    import asyncio
+    from job_tracker_mcp import server
+    prompts = asyncio.run(server.mcp.list_prompts())
+    names = {p.name for p in prompts}
+    assert names == {"triage_job_alerts", "setup_job_filters"}
+    assert all(p.description for p in prompts)
+
+
+def test_prompts_render_through_a_real_mcp_client():
+    """Listing them is not enough; Claude Desktop calls get_prompt."""
+    import asyncio
+    from fastmcp import Client
+    from job_tracker_mcp import server
+
+    async def go():
+        async with Client(server.mcp) as c:
+            r = await c.get_prompt("triage_job_alerts", {"since": "2026-07-01"})
+            return r.messages[0].content.text
+
+    body = asyncio.run(go())
+    assert "2026-07-01" in body                  # the argument is substituted
+    assert len(body) > 1000
+
+
+def test_triage_prompt_pins_the_things_that_go_wrong():
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts(since="2026-07-01")
+    assert "2026-07-01" in body
+    assert "NOT today's date" in body            # date_seen is the email's date
+    assert "VERBATIM" in body                    # no hand-normalizing
+    assert "Never call mark_applied" in body     # applying is the human's act
+    assert "possible_duplicates" in body
+
+
+def test_filter_prompt_explains_the_three_pattern_types():
+    from job_tracker_mcp.server import setup_job_filters
+    body = setup_job_filters()
+    for kind in ("company", "title_keyword", "source"):
+        assert kind in body
+    assert "STILL STORED" in body                # filtered jobs are kept
+    assert "WAIT for me to approve" in body      # never installs unilaterally

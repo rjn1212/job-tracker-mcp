@@ -631,3 +631,43 @@ def test_unmerge_restores(db):
     assert db.get_job(dup["id"])["merged_into"] is None
     assert db.get_job(dup["id"])["notes"] == "dup note"  # never modified
     assert "error" in db.unmerge_job(dup["id"])  # not merged any more
+
+
+# ------------------------------------------------------- date_seen (first appearance)
+
+def test_date_seen_defaults_to_today(db):
+    from job_tracker_mcp.database import today_str
+    r = add(db)
+    assert db.get_job(r["id"])["date_seen"] == today_str()
+
+
+def test_date_seen_records_when_the_posting_appeared(db):
+    """The alert email's date, NOT the date triage ran."""
+    r = add(db, date_seen="2026-06-01")
+    job = db.get_job(r["id"])
+    assert job["date_seen"] == "2026-06-01"
+    assert job["last_seen"] == "2026-06-01"
+
+
+def test_backlog_import_keeps_earliest_first_seen(db):
+    """Emails do not arrive in date order, and a backlog is replayed in any order."""
+    r = add(db, date_seen="2026-06-10")
+    add(db, date_seen="2026-06-20")        # a later sighting
+    add(db, date_seen="2026-06-01")        # an OLDER email, processed last
+    job = db.get_job(r["id"])
+    assert job["date_seen"] == "2026-06-01"   # first appearance never moves forward
+    assert job["last_seen"] == "2026-06-20"   # last sighting never moves backward
+    assert job["times_seen"] == 3
+
+
+def test_date_seen_validated(db):
+    assert "error" in db.add_job(company="C", title="T", location="R", date_seen="06/01/2026")
+    assert db.get_stats()["total_jobs"] == 0
+
+
+def test_bulk_add_jobs_carries_date_seen(db):
+    out = db.bulk_add_jobs([
+        {"company": "Acme", "title": "SRE", "location": "Remote", "date_seen": "2026-05-05"},
+    ])
+    assert out["created"] == 1
+    assert db.get_jobs()["jobs"][0]["date_seen"] == "2026-05-05"
