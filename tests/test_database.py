@@ -733,3 +733,109 @@ def test_record_triage_run_validates_the_datetime(db):
 
 def test_record_triage_run_accepts_a_z_suffix(db):
     assert db.record_triage_run(ACCT, MBOX, "2026-07-09T22:33:43Z")["result"] == "recorded"
+
+
+# ---------------------------------------------- positive rules (off_profile)
+
+def test_no_rules_means_everything_is_on_profile(db):
+    """An empty include list must mean 'everything qualifies', never the reverse."""
+    r = add(db, title="Head of Engineering")
+    assert r["off_profile"] is False
+    assert len(db.get_jobs()["jobs"]) == 1
+
+
+def test_include_rule_demotes_a_non_matching_title(db):
+    add(db, company="Acme", title="Director of Software Engineering")
+    add(db, company="Globex", title="Head of Engineering")
+    db.add_profile_rule("title_include", "director")
+    titles = [j["title"] for j in db.get_jobs()["jobs"]]
+    assert titles == ["Director of Software Engineering"]
+    assert db.get_stats()["off_profile_new"] == 1
+
+
+def test_off_profile_jobs_are_stored_not_rejected(db):
+    r = add(db, title="Head of Engineering")
+    db.add_profile_rule("title_include", "director")
+    job = db.get_job(r["id"])
+    assert job["status"] == "new"          # NOT rejected
+    assert job["off_profile"] is True
+    assert any(j["id"] == r["id"] for j in db.get_jobs(include_off_profile=True)["jobs"])
+
+
+def test_exclude_beats_include(db):
+    r = add(db, title="Junior Director")
+    db.add_profile_rule("title_include", "director")
+    db.add_profile_rule("title_exclude", "junior")
+    assert db.get_job(r["id"])["off_profile"] is True
+
+
+def test_rules_reclassify_existing_jobs_retroactively(db):
+    """off_profile is DERIVED, so a rule change re-evaluates it. Safe: no status change."""
+    add(db, company="A", title="Director of Engineering")
+    add(db, company="B", title="Head of Engineering")
+    out = db.add_profile_rule("title_include", "director")
+    assert out["reclassified"] == 1
+    out = db.remove_profile_rule(out["id"])
+    assert out["reclassified"] == 1        # everything back on-profile
+    assert db.get_stats()["off_profile_new"] == 0
+
+
+def test_profile_rules_never_change_status(db):
+    r = add(db, title="Head of Engineering")
+    db.add_profile_rule("title_include", "director")
+    assert db.get_job(r["id"])["status"] == "new"
+    assert db.get_stats()["by_status"]["rejected"] == 0
+
+
+def test_applied_jobs_are_never_hidden_by_profile_rules(db):
+    """History must not vanish because you later narrowed your search."""
+    r = add(db, title="Head of Engineering")
+    db.mark_applied(r["id"], date_applied="2026-06-01")
+    db.add_profile_rule("title_include", "director")
+    assert db.get_job(r["id"])["off_profile"] is True
+    assert any(j["id"] == r["id"] for j in db.get_jobs()["jobs"])          # still listed
+    assert any(j["id"] == r["id"] for j in db.get_jobs(status="applied")["jobs"])
+
+
+def test_off_profile_new_jobs_excluded_from_unscored_backlog(db):
+    add(db, company="A", title="Director of Engineering")
+    add(db, company="B", title="Head of Engineering")
+    db.add_profile_rule("title_include", "director")
+    s = db.get_stats()
+    assert s["unscored_new"] == 1 and s["off_profile_new"] == 1
+
+
+def test_profile_rule_matches_canonical_title(db):
+    """Decorations are already stripped; seniority is not."""
+    r = add(db, title="Director of Engineering (Remote) [R-123]")
+    db.add_profile_rule("title_include", "director of engineering")
+    assert db.get_job(r["id"])["off_profile"] is False
+
+
+def test_profile_rule_validation(db):
+    assert "error" in db.add_profile_rule("bogus", "x")
+    assert "error" in db.add_profile_rule("title_include", "   ")
+    assert "error" in db.remove_profile_rule(999)
+
+
+def test_duplicate_profile_rule_is_not_an_error(db):
+    a = db.add_profile_rule("title_include", "director")
+    b = db.add_profile_rule("title_include", "DIRECTOR ")
+    assert a["result"] == "added" and b["result"] == "exists" and a["id"] == b["id"]
+    assert db.get_profile_rules()["total"] == 1
+
+
+def test_bulk_add_reports_off_profile_count(db):
+    db.add_profile_rule("title_include", "director")
+    out = db.bulk_add_jobs([
+        {"company": "A", "title": "Director of Eng", "location": "R"},
+        {"company": "B", "title": "Head of Eng", "location": "R"},
+    ])
+    assert out["created"] == 2 and out["off_profile"] == 1 and out["auto_rejected"] == 0
+
+
+def test_recompute_profiles_is_idempotent(db):
+    add(db, title="Head of Engineering")
+    db.add_profile_rule("title_include", "director")
+    assert db.recompute_profiles()["reclassified"] == 0     # already correct
+    assert db.recompute_profiles()["off_profile_jobs"] == 1

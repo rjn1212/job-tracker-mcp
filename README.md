@@ -277,7 +277,42 @@ The division of labour matters more than the prompt text:
 - **Judgment lives in the model.** Fit scores, whether two similar titles are
   one requisition, reading an unstructured page.
 
-### Filters
+### Filters: two kinds, deliberately asymmetric
+
+**Negative** filters (`rejected_patterns`) — a match **rejects**.
+**Positive** filters (`profile_rules`) — a non-match **demotes**.
+
+The asymmetry is the whole design. A bad negative rule wrongly rejects one
+company; the row is still stored, tagged with the pattern that caught it, and one
+`update_job` from returning. A bad *positive* rule silently drops everything it
+didn't anticipate — `Head of Engineering`, `Distinguished Engineer`, `VP,
+Platform` — and the good jobs are exactly the ones with unusual titles. So a
+positive non-match never rejects; it sets `off_profile`, which hides the job from
+the default triage list and nothing more.
+
+#### Positive rules (`profile_rules`)
+
+| kind | effect |
+|---|---|
+| `title_include` | on-profile if the canonical title contains **any** include value |
+| `title_exclude` | off-profile if it contains **any** exclude value (excludes beat includes) |
+
+**With no include rules at all, every job is on-profile** — never the reverse.
+
+`off_profile` is **derived, not a decision**, so `add_profile_rule` and
+`remove_profile_rule` immediately reclassify existing jobs and report how many.
+Status is never touched. `get_jobs()` hides off-profile **new** jobs; pass
+`include_off_profile=true` to see them. Applied, rejected and expired jobs are
+*never* hidden — history must not vanish because you narrowed your search later.
+
+That retroactive sweep is safe precisely *because* it only moves a flag.
+`rejected_patterns` has no equivalent, and shouldn't: rejecting is a decision,
+and a retroactive one could bury a job you already applied to.
+
+Include lists are dangerous when narrow. `director` demotes `Head of
+Engineering`. Be generous, then audit with `get_jobs(include_off_profile=true)`.
+
+#### Negative rules (`rejected_patterns`)
 
 A filter is a row in `rejected_patterns`, of exactly one of three kinds:
 

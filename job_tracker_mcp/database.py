@@ -20,7 +20,9 @@ from job_tracker_mcp.models import (
     ALLOWED_TRANSITIONS,
     JOB_FIELDS,
     PATTERN_TYPES,
+    PROFILE_RULE_TYPES,
     STATUSES,
+    evaluate_profile,
     canonicalize_company,
     canonicalize_location,
     canonicalize_title,
@@ -34,7 +36,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -70,9 +72,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     notes              TEXT,
     email_subject      TEXT,
     merged_into        TEXT REFERENCES jobs(id),
+    -- Derived from profile_rules, NOT a decision. Recomputed whenever the rules
+    -- change, so a rule edit never leaves stale flags behind.
+    off_profile        INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL,
 
+    CHECK (off_profile IN (0, 1)),
     CHECK (status IN ('new', 'applied', 'rejected', 'expired')),
     CHECK (fit_score IS NULL OR (fit_score BETWEEN 1 AND 10)),
     CHECK (times_seen >= 1),
@@ -101,6 +107,22 @@ CREATE INDEX IF NOT EXISTS idx_jobs_date_seen ON jobs(date_seen);
 CREATE INDEX IF NOT EXISTS idx_jobs_source    ON jobs(source);
 CREATE INDEX IF NOT EXISTS idx_jobs_merged    ON jobs(merged_into);
 CREATE INDEX IF NOT EXISTS idx_jobs_triage    ON jobs(status, fit_score DESC, date_seen DESC);
+
+-- Positive rules. Unlike rejected_patterns these DEMOTE rather than reject, and
+-- because off_profile is derived they can be re-evaluated against existing rows.
+CREATE TABLE IF NOT EXISTS profile_rules (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_type  TEXT NOT NULL,
+    value      TEXT NOT NULL,        -- lowercased and stripped
+    reason     TEXT,
+    created_at TEXT NOT NULL,
+
+    CHECK (rule_type IN ('title_include', 'title_exclude')),
+    CHECK (length(trim(value)) > 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_rules_unique
+    ON profile_rules(rule_type, value);
 
 -- Small key/value store for the server's own bookkeeping. Currently: the
 -- high-water mark of the last triage run, per mailbox.
@@ -199,7 +221,7 @@ class Database:
         `CREATE TABLE IF NOT EXISTS` is re-runnable, `ADD COLUMN` is not.
         """
         steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
-                 3: self._migrate_3_to_4}
+                 3: self._migrate_3_to_4, 4: self._migrate_4_to_5}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -224,6 +246,24 @@ class Database:
             "CREATE TABLE IF NOT EXISTS app_state ("
             "  key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
         )
+
+    def _migrate_4_to_5(self) -> None:
+        if not self._has_column("jobs", "off_profile"):
+            # NOT NULL with a constant default is legal for ADD COLUMN; existing
+            # rows become on-profile, which is right: there are no rules yet.
+            self.conn.execute(
+                "ALTER TABLE jobs ADD COLUMN off_profile INTEGER NOT NULL DEFAULT 0")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS profile_rules ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  rule_type TEXT NOT NULL, value TEXT NOT NULL,"
+            "  reason TEXT, created_at TEXT NOT NULL,"
+            "  CHECK (rule_type IN ('title_include', 'title_exclude')),"
+            "  CHECK (length(trim(value)) > 0))"
+        )
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_rules_unique"
+            "  ON profile_rules(rule_type, value)")
 
     # ----------------------------------------------------------- validation
 
@@ -297,6 +337,89 @@ class Database:
                 matched.append(f"source:{pval}")
         return matched
 
+    # ------------------------------------------------------- profile rules
+
+    def _load_profile_rules(self, cur) -> tuple[list[str], list[str]]:
+        rows = cur.execute("SELECT rule_type, value FROM profile_rules").fetchall()
+        includes = [r["value"] for r in rows if r["rule_type"] == "title_include"]
+        excludes = [r["value"] for r in rows if r["rule_type"] == "title_exclude"]
+        return includes, excludes
+
+    def _recompute_profiles(self, cur) -> int:
+        """Re-derive off_profile for every live job. Never touches status.
+
+        off_profile is DERIVED data, not a decision, which is exactly why this
+        sweep is safe and why rejected_patterns has no equivalent: rejecting is
+        a decision, and a retroactive one could bury a job you applied to.
+        """
+        includes, excludes = self._load_profile_rules(cur)
+        changed = 0
+        for row in cur.execute(
+                f"SELECT id, title_canonical, off_profile FROM jobs WHERE {LIVE}").fetchall():
+            off, _ = evaluate_profile(row["title_canonical"], includes, excludes)
+            if bool(row["off_profile"]) != off:
+                cur.execute("UPDATE jobs SET off_profile = ? WHERE id = ?",
+                            (1 if off else 0, row["id"]))
+                changed += 1
+        return changed
+
+    def get_profile_rules(self) -> dict:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, rule_type, value, reason, created_at FROM profile_rules "
+                "ORDER BY rule_type, value").fetchall()
+            off = self.conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE off_profile = 1 AND {LIVE}").fetchone()[0]
+        return {"rules": [dict(r) for r in rows], "total": len(rows),
+                "off_profile_jobs": off,
+                "message": ("No rules: every job is on-profile."
+                            if not rows else
+                            f"{off} live job(s) are currently off-profile.")}
+
+    def add_profile_rule(self, rule_type: str, value: str,
+                         reason: str | None = None) -> dict:
+        if rule_type not in PROFILE_RULE_TYPES:
+            return _err(f"Invalid rule_type {rule_type!r}. "
+                        f"Must be one of: {', '.join(PROFILE_RULE_TYPES)}")
+        v = normalize_key_part(value)
+        if not v:
+            return _err("value must not be empty")
+
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO profile_rules (rule_type, value, reason, created_at) "
+                "VALUES (?, ?, ?, ?)", (rule_type, v, reason, now_str()))
+            added = bool(cur.rowcount)
+            rid = cur.lastrowid if added else self.conn.execute(
+                "SELECT id FROM profile_rules WHERE rule_type = ? AND value = ?",
+                (rule_type, v)).fetchone()["id"]
+            changed = self._recompute_profiles(self.conn)
+
+        return {"result": "added" if added else "exists", "id": rid,
+                "reclassified": changed,
+                "message": (f"Rule {rule_type} = {v}. {changed} existing job(s) "
+                            f"reclassified. Nothing was rejected -- off-profile jobs "
+                            f"are hidden from the default list, not removed.")}
+
+    def remove_profile_rule(self, id: int) -> dict:
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT rule_type, value FROM profile_rules WHERE id = ?", (id,)).fetchone()
+            if row is None:
+                return _err(f"No profile rule with id {id}")
+            self.conn.execute("DELETE FROM profile_rules WHERE id = ?", (id,))
+            changed = self._recompute_profiles(self.conn)
+        return {"result": "removed", "id": id, "reclassified": changed,
+                "message": f"Rule removed: {row['rule_type']} = {row['value']}. "
+                           f"{changed} job(s) reclassified."}
+
+    def recompute_profiles(self) -> dict:
+        with self._lock, self.conn:
+            changed = self._recompute_profiles(self.conn)
+            off = self.conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE off_profile = 1 AND {LIVE}").fetchone()[0]
+        return {"result": "recomputed", "reclassified": changed, "off_profile_jobs": off}
+
     def _check_rejected_patterns(
         self, company: str, title: str, source: str | None
     ) -> list[str]:
@@ -355,7 +478,7 @@ class Database:
             ).fetchone()
         return row
 
-    def _add_one(self, cur, patterns, entry: dict) -> dict:
+    def _add_one(self, cur, patterns, profile_rules, entry: dict) -> dict:
         """Insert or record a re-sighting. Assumes an open transaction."""
         company = (entry.get("company") or "").strip()
         title = (entry.get("title") or "").strip()
@@ -421,14 +544,20 @@ class Database:
             auto = f"Auto-rejected: matched {', '.join(matched)}"
             notes = f"{notes}\n{auto}" if notes else auto
 
+        # Positive rules DEMOTE. A non-match is hidden from the default list,
+        # never rejected: the good jobs are the ones with unusual titles.
+        includes, excludes = profile_rules
+        off_profile, profile_reasons = evaluate_profile(t_canon, includes, excludes)
+
         cur.execute(
             "INSERT INTO jobs (id, company, company_canonical, title, title_canonical, "
             "location, location_canonical, url, source, date_seen, last_seen, "
             "times_seen, date_applied, status, fit_score, notes, email_subject, "
-            "merged_into, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, NULL, ?, ?)",
+            "merged_into, off_profile, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, NULL, ?, ?, ?)",
             (job_id, company, c_canon, title, t_canon, location, l_canon, url, source,
-             seen, seen, status, fit_score, notes, email_subject, now, now),
+             seen, seen, status, fit_score, notes, email_subject,
+             1 if off_profile else 0, now, now),
         )
         result = {
             "result": "created",
@@ -438,6 +567,8 @@ class Database:
             "status": status,
             "auto_rejected": bool(matched),
             "matched_patterns": matched,
+            "off_profile": off_profile,
+            "profile_reasons": profile_reasons,
             "message": f"Job added: {title} at {company}",
         }
         similar = self._find_similar(cur, c_canon, t_canon, job_id)
@@ -468,7 +599,8 @@ class Database:
         )
         with self._lock, self.conn:
             cur = self.conn.cursor()
-            result = self._add_one(cur, self._load_patterns(cur), entry)
+            result = self._add_one(cur, self._load_patterns(cur),
+                                   self._load_profile_rules(cur), entry)
         if result["result"] == "error":
             return _err(result["message"])
         return result
@@ -485,16 +617,18 @@ class Database:
         with self._lock, self.conn:
             cur = self.conn.cursor()
             patterns = self._load_patterns(cur)
+            profile_rules = self._load_profile_rules(cur)
             for entry in jobs:
                 if not isinstance(entry, dict):
                     results.append({"result": "error", "message": f"not an object: {entry!r}"})
                     continue
-                results.append(self._add_one(cur, patterns, entry))
+                results.append(self._add_one(cur, patterns, profile_rules, entry))
 
         return {
             "created": sum(r["result"] == "created" for r in results),
             "duplicates": sum(r["result"] == "duplicate" for r in results),
             "auto_rejected": sum(r.get("auto_rejected", False) for r in results),
+            "off_profile": sum(r.get("off_profile", False) for r in results),
             "errors": sum(r["result"] == "error" for r in results),
             "possible_duplicates": sum("possible_duplicates" in r for r in results),
             "results": results,
@@ -528,8 +662,14 @@ class Database:
         min_fit_score: int | None = None,
         limit: int | None = 50,
         offset: int | None = 0,
+        include_off_profile: bool = False,
     ) -> dict:
         where, params = [LIVE], []
+        if not include_off_profile:
+            # Hide off-profile jobs from the TRIAGE list only. A job you applied
+            # to is history, not a candidate, and must never vanish because you
+            # later narrowed your profile rules.
+            where.append("(off_profile = 0 OR status != 'new')")
         if status is not None:
             if msg := self._bad_status(status):
                 return _err(msg)
@@ -559,7 +699,8 @@ class Database:
             ).fetchall()
 
         return {"jobs": [row_to_job(r) for r in rows], "total": total,
-                "offset": offset, "limit": limit}
+                "offset": offset, "limit": limit,
+                "include_off_profile": include_off_profile}
 
     def search_jobs(
         self,
@@ -1048,7 +1189,12 @@ class Database:
 
             unscored_new = self.conn.execute(
                 f"SELECT COUNT(*) FROM jobs WHERE status = 'new' "
-                f"AND fit_score IS NULL AND {LIVE}"
+                f"AND fit_score IS NULL AND off_profile = 0 AND {LIVE}"
+            ).fetchone()[0]
+
+            off_profile_new = self.conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE status = 'new' "
+                f"AND off_profile = 1 AND {LIVE}"
             ).fetchone()[0]
 
             merged = self.conn.execute(
@@ -1063,5 +1209,8 @@ class Database:
                 "avg_fit_score_new": avg("new"),
                 "avg_fit_score_applied": avg("applied"),
                 "unscored_new": unscored_new,
+                "off_profile_new": off_profile_new,
+                "profile_rules": self.conn.execute(
+                    "SELECT COUNT(*) FROM profile_rules").fetchone()[0],
                 "merged_duplicates": merged,
             }

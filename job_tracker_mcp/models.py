@@ -26,8 +26,23 @@ class PatternType(StrEnum):
     SOURCE = "source"
 
 
+class ProfileRuleType(StrEnum):
+    """Positive rules. They DEMOTE rather than reject.
+
+    A bad exclusion rule wrongly rejects a job, but the row is stored, tagged,
+    and one update_job from returning. A bad INCLUSION rule silently drops
+    everything it did not anticipate -- "Head of Engineering", "Distinguished
+    Engineer" -- and the good jobs are exactly the ones with unusual titles.
+    So a non-match sets off_profile, which hides the job from the default
+    triage list and nothing more.
+    """
+    TITLE_INCLUDE = "title_include"   # on-profile if the title contains ANY of these
+    TITLE_EXCLUDE = "title_exclude"   # off-profile if the title contains ANY of these
+
+
 STATUSES = tuple(s.value for s in Status)
 PATTERN_TYPES = tuple(p.value for p in PatternType)
+PROFILE_RULE_TYPES = tuple(p.value for p in ProfileRuleType)
 
 # Authoritative. update_job and mark_applied are the only consumers.
 # Self-transitions are permitted so that retries are idempotent.
@@ -44,12 +59,32 @@ JOB_FIELDS = (
     "location", "location_canonical", "url", "source",
     "date_seen", "last_seen", "times_seen", "date_applied",
     "status", "fit_score", "notes", "email_subject", "merged_into",
-    "created_at", "updated_at",
+    "off_profile", "created_at", "updated_at",
 )
 
 
 def row_to_job(row: sqlite3.Row) -> dict:
-    return {k: row[k] for k in JOB_FIELDS}
+    d = {k: row[k] for k in JOB_FIELDS}
+    d["off_profile"] = bool(d["off_profile"])
+    return d
+
+
+def evaluate_profile(title_canonical: str, includes: list[str],
+                     excludes: list[str]) -> tuple[bool, list[str]]:
+    """(off_profile, reasons). Rules are already lowercased.
+
+    On-profile means: it matches at least one include (or there are none), AND
+    it matches no exclude. An EMPTY include list means "everything qualifies" --
+    never "nothing qualifies", which would hide the whole tracker the moment a
+    rule table exists but is unpopulated.
+    """
+    tc = title_canonical or ""
+    hit_exclude = [e for e in excludes if e in tc]
+    if hit_exclude:
+        return True, [f"title_exclude:{e}" for e in hit_exclude]
+    if includes and not any(i in tc for i in includes):
+        return True, ["matched no title_include rule"]
+    return False, []
 
 
 # --------------------------------------------------------------------------

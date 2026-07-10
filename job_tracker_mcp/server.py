@@ -198,17 +198,24 @@ def get_jobs(
     min_fit_score: int | None = None,
     limit: int | None = 50,
     offset: int | None = 0,
+    include_off_profile: bool = False,
 ) -> dict:
     """List jobs, best fit first, then most recently seen. Unscored jobs sort last.
 
     status        -- new | applied | rejected | expired
     min_fit_score -- excludes unscored jobs, which cannot meet a threshold
     limit         -- clamped to 200
+    include_off_profile -- by default, NEW jobs that match no profile rule are
+                     hidden. They are stored, not rejected. Pass true to see
+                     them, e.g. to check whether a rule is too narrow.
+
+    Applied, rejected and expired jobs are never hidden by profile rules --
+    history must not vanish because you later narrowed what you are looking for.
 
     `total` is the number of jobs matching the filters, ignoring limit/offset.
     If total > offset + len(jobs), there are more pages.
     """
-    return db.get_jobs(status, source, min_fit_score, limit, offset)
+    return db.get_jobs(status, source, min_fit_score, limit, offset, include_off_profile)
 
 
 @mcp.tool
@@ -335,6 +342,61 @@ def search_jobs(
     Returns the same shape as get_jobs.
     """
     return db.search_jobs(query, status, limit, offset)
+
+
+@mcp.tool
+@_tool_guard
+def get_profile_rules() -> dict:
+    """Show the positive rules that decide which jobs are on-profile.
+
+    Unlike rejected_patterns these DEMOTE rather than reject. A job matching no
+    title_include rule (or matching a title_exclude) is still stored as "new",
+    flagged off_profile, and hidden from the default get_jobs list. Nothing is
+    discarded, and get_jobs(include_off_profile=true) shows everything.
+    """
+    return db.get_profile_rules()
+
+
+@mcp.tool
+@_tool_guard
+def add_profile_rule(rule_type: str, value: str, reason: str | None = None) -> dict:
+    """Add a positive rule. rule_type is title_include or title_exclude.
+
+    title_include -- a job is on-profile if its title contains ANY include value.
+                     With no include rules at all, every job is on-profile.
+    title_exclude -- a job is off-profile if its title contains ANY exclude value.
+                     Excludes beat includes.
+
+    Both are substring matches against the canonicalized title, so "(Remote)",
+    salary and req ids are already gone -- but seniority is NOT. Case-insensitive.
+
+    off_profile is DERIVED, so adding a rule immediately reclassifies existing
+    jobs. The response says how many. This never changes any job's status: an
+    off-profile job is hidden, not rejected. Contrast add_rejected_pattern,
+    which applies only to future inserts because rejecting IS a decision.
+
+    Beware narrow include lists. "director" demotes "Head of Engineering" and
+    "VP, Engineering". Check with get_jobs(include_off_profile=true) afterward.
+    """
+    return db.add_profile_rule(rule_type, value, reason)
+
+
+@mcp.tool
+@_tool_guard
+def remove_profile_rule(id: int) -> dict:
+    """Remove a positive rule, and reclassify every job against what remains."""
+    return db.remove_profile_rule(id)
+
+
+@mcp.tool
+@_tool_guard
+def recompute_profiles() -> dict:
+    """Re-derive off_profile for every live job from the current rules.
+
+    Rules already recompute on add/remove, so this is only needed after a direct
+    database edit or a code change to the matcher. Safe: it never touches status.
+    """
+    return db.recompute_profiles()
 
 
 @mcp.tool
@@ -701,9 +763,22 @@ Help me define my job-alert filters, then install them.
 
 All tools below are on the `job-tracker` MCP server.
 
-HOW FILTERS WORK (read this before proposing any).
+THERE ARE TWO KINDS OF FILTER, and they behave differently on purpose.
 
-A filter is a row in `rejected_patterns`. There are exactly three kinds:
+  NEGATIVE (rejected_patterns) -- a match REJECTS the job.
+  POSITIVE (profile_rules)     -- a non-match DEMOTES the job.
+
+The asymmetry is deliberate. A bad negative rule wrongly rejects one company,
+and the row is still stored, tagged with the pattern that caught it, and one
+update_job from coming back. A bad POSITIVE rule silently drops everything it
+did not anticipate -- "Head of Engineering", "Distinguished Engineer", "VP,
+Platform" -- and the good jobs are exactly the ones with unusual titles. So a
+positive non-match never rejects: it sets off_profile, which hides the job from
+the default list and nothing more.
+
+=== NEGATIVE FILTERS: rejected_patterns ===
+
+A match stores the job with status="rejected". Three kinds:
 
   company        substring match against the canonicalized company name.
                  "infosys" matches "Infosys BPM Ltd" and "Infosys, Inc."
@@ -721,7 +796,31 @@ A filter is a row in `rejected_patterns`. There are exactly three kinds:
                  there would surprise.
 
 Matching is case-insensitive. Patterns are checked at INSERT time only: adding
-a pattern never retroactively rejects jobs already in the database.
+a pattern never retroactively rejects jobs already in the database. That is on
+purpose -- rejecting is a decision, and a retroactive one could bury a job I
+already applied to.
+
+=== POSITIVE FILTERS: profile_rules ===
+
+Two kinds, both substring matches against the canonical title:
+
+  title_include  a job is on-profile if its title contains ANY include value.
+                 WITH NO INCLUDE RULES AT ALL, EVERY JOB IS ON-PROFILE.
+  title_exclude  a job is off-profile if its title contains ANY exclude value.
+                 Excludes beat includes: "Junior Director" is off-profile even
+                 with include "director".
+
+A non-matching job is stored as status="new" with off_profile=true. It is hidden
+from get_jobs() but visible with get_jobs(include_off_profile=true), and it is
+counted in get_stats().off_profile_new.
+
+off_profile is DERIVED, not a decision, so add_profile_rule and
+remove_profile_rule immediately RECLASSIFY existing jobs and report how many.
+Status is never touched. Applied jobs are never hidden -- history must not
+vanish because I narrowed my search later.
+
+Include lists are dangerous when narrow. "director" demotes "Head of
+Engineering". Propose a GENEROUS include list, then check it.
 
 A matching job is STILL STORED, with status="rejected" and a note recording
 which pattern fired. It is not discarded. This is deliberate:
@@ -740,17 +839,37 @@ and read what comes back. If it catches something you want, do not install it.
 
 WHAT TO DO NOW.
 
-1. Ask me what I want filtered. Probe for: staffing agencies and body shops by
-   name; title keywords that mean "not for me" (contract, clearance, junior,
-   intern); job boards I do not trust.
-2. For each candidate, run search_jobs against my existing 28 jobs and show me
-   what it would have caught. A pattern that catches a job I applied to is a
-   bad pattern.
-3. Show me the final list and WAIT for me to approve it.
-4. Only then call add_rejected_pattern(pattern_type, pattern_value, reason) for
-   each. Always give a reason -- in six months it is the only thing that
-   explains why a company is invisible.
-5. Finish with get_rejected_patterns() so I can see exactly what is installed.
+1. Ask me what I want. Probe for:
+   - staffing agencies and body shops by name        -> company
+   - title words that mean "never"                    -> title_keyword
+     (contract, clearance) -- these REJECT.
+   - job boards I do not trust                        -> source
+   - the titles I actually want                       -> title_include
+   - title words that mean "not my level"             -> title_exclude
+     (junior, intern, associate) -- these DEMOTE.
+
+   The line between title_keyword (reject) and title_exclude (demote) is: would
+   I ever want to see this job again? If never, reject. If it is merely off my
+   path, demote.
+
+2. Test every candidate BEFORE installing it. Call
+       search_jobs(query="<value>")
+   and read what it would have caught among my real jobs. A rule that catches a
+   job I applied to is a bad rule. Say so, and propose a narrower one.
+
+3. For the include list, err GENEROUS. Then, after installing, call
+       get_jobs(include_off_profile=true)
+   and show me every job the rules demoted. If a good job is in there, the
+   include list is too narrow -- fix it before we go further.
+
+4. Show me the final lists and WAIT for me to approve them.
+
+5. Only then call add_rejected_pattern(...) and add_profile_rule(...) for each.
+   Always give a reason -- in six months it is the only thing that explains why
+   a company is invisible.
+
+6. Finish with get_rejected_patterns() and get_profile_rules() so I can see
+   exactly what is installed, then get_stats() for off_profile_new.
 
 Do not install anything I have not explicitly approved.
 """

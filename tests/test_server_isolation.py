@@ -49,7 +49,7 @@ def test_import_without_client_id(tmp_path):
     r = _fresh_import({"JOB_TRACKER_DB": str(tmp_path / "t.db")}, IMPORT_AND_COUNT)
     assert r.returncode == 0, r.stderr
     assert r.stdout == ""
-    assert "TOOLS=27" in r.stderr
+    assert "TOOLS=31" in r.stderr
 
 
 def test_database_constructor_imports_no_network_stack(tmp_path):
@@ -281,3 +281,13 @@ def test_triage_prompt_since_overrides_watermark():
     from job_tracker_mcp.server import triage_job_alerts
     assert "overrode the watermark" in triage_job_alerts(since="2026-07-01")
     assert "overrode the watermark" not in triage_job_alerts()
+
+
+def test_filter_prompt_distinguishes_reject_from_demote():
+    from job_tracker_mcp.server import setup_job_filters
+    body = setup_job_filters()
+    assert "NEGATIVE" in body and "POSITIVE" in body
+    assert "title_include" in body and "title_exclude" in body
+    assert "EVERY JOB IS ON-PROFILE" in body      # empty include list is not a trap
+    assert "err GENEROUS" in body                 # narrow includes demote good jobs
+    assert "include_off_profile=true" in body     # verify after installing
