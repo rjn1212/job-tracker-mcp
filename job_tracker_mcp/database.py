@@ -36,7 +36,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -221,7 +221,8 @@ class Database:
         `CREATE TABLE IF NOT EXISTS` is re-runnable, `ADD COLUMN` is not.
         """
         steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
-                 3: self._migrate_3_to_4, 4: self._migrate_4_to_5}
+                 3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
+                 5: self._migrate_5_to_6}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -264,6 +265,46 @@ class Database:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_rules_unique"
             "  ON profile_rules(rule_type, value)")
+
+    def _migrate_5_to_6(self) -> None:
+        """canonicalize_title changed, so every id must be recomputed.
+
+        LinkedIn writes req ids as bare parentheses -- "Director, Software
+        Engineering (1139652)" -- which the old canonicalizer kept, so the same
+        job from an email never deduped against the same job from OneNote.
+
+        This is the id-rebuild the warning in models.py demands. It is idempotent:
+        a row whose id already matches its recomputed id is skipped, so a crash
+        between the DDL and the version bump is harmless.
+        """
+        rows = self.conn.execute(
+            "SELECT id, company, title, location FROM jobs").fetchall()
+        renames = {}
+        for r in rows:
+            new = generate_job_id(r["company"], r["title"], r["location"])
+            if new != r["id"]:
+                renames[r["id"]] = new
+        if not renames:
+            return
+
+        existing = {r["id"] for r in rows}
+        survivors = existing - set(renames)
+        for old, new in renames.items():
+            if new in survivors or list(renames.values()).count(new) > 1:
+                raise RuntimeError(
+                    f"Rebuilding ids would collide on {new} (from {old}). Two rows "
+                    f"now canonicalize identically. Resolve by hand with merge_jobs "
+                    f"before upgrading; refusing to guess which row survives."
+                )
+
+        # PRAGMA foreign_keys is a no-op inside a transaction; defer_foreign_keys
+        # is not. FKs are then checked once, at COMMIT.
+        self.conn.execute("PRAGMA defer_foreign_keys = ON")
+        for old, new in renames.items():
+            self.conn.execute("UPDATE onenote_links SET job_id = ? WHERE job_id = ?", (new, old))
+            self.conn.execute("UPDATE jobs SET merged_into = ? WHERE merged_into = ?", (new, old))
+            self.conn.execute("UPDATE jobs SET id = ? WHERE id = ?", (new, old))
+        log.info("rebuilt %d job id(s) after a canonicalization change", len(renames))
 
     # ----------------------------------------------------------- validation
 
@@ -344,6 +385,15 @@ class Database:
         includes = [r["value"] for r in rows if r["rule_type"] == "title_include"]
         excludes = [r["value"] for r in rows if r["rule_type"] == "title_exclude"]
         return includes, excludes
+
+    def rebuild_ids(self) -> dict:
+        """Recompute every id from the current canonicalizers. Used by migrations
+        and available after a deliberate canonicalization change."""
+        with self._lock, self.conn:
+            before = self.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            self._migrate_5_to_6()
+            after = self.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        return {"result": "rebuilt", "jobs": after, "lost": before - after}
 
     def _recompute_profiles(self, cur) -> int:
         """Re-derive off_profile for every live job. Never touches status.

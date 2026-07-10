@@ -202,6 +202,11 @@ def canonicalize_company(value: str | None) -> str:
 _SALARY = re.compile(r"\$\s*\d")
 _PAY_RANGE = re.compile(r"^[\d,.]+\s*k?\s*[-–—]\s*[\d,.]+\s*k?(\s*(usd|eur|gbp))?$")
 _REQ_ID = re.compile(r"^(req|job|jr|r)[-\s#]?\d+$")
+# A parenthetical that is nothing but a number is a requisition id. LinkedIn
+# writes "Director, Software Engineering (1139652)"; without this, that title
+# never dedups against the same job written without the id. Four digits or more,
+# so "(2 openings)" and "(3)" are left alone -- and "(Health Tech)" obviously is.
+_BARE_REQ_NUMBER = re.compile(r"^[\d][\d,.\-]{3,}$")
 # Only split on separators surrounded by whitespace: "Full-Stack Engineer" and
 # "Front-end Developer" must survive intact.
 _TITLE_SPLIT = re.compile(r"\s+[-–—|]\s+")
@@ -209,7 +214,13 @@ _BRACKETED = re.compile(r"\[[^\]]*\]")
 _PARENTHETICAL = re.compile(r"\(([^)]*)\)")
 
 
-def _is_noise_segment(seg: str) -> bool:
+def _is_noise_segment(seg: str, in_parens: bool = False) -> bool:
+    """Is this fragment something other than part of the role name?
+
+    `in_parens` widens the test: a bare number is a req id when parenthesized
+    ("(1139652)") but could be meaningful in running text, so it is only
+    stripped inside brackets.
+    """
     s = seg.strip()
     if not s:
         return True
@@ -219,6 +230,8 @@ def _is_noise_segment(seg: str) -> bool:
     if _SALARY.search(s):
         return True
     low = s.lower()
+    if in_parens and _BARE_REQ_NUMBER.match(low):
+        return True
     return bool(_PAY_RANGE.match(low) or _REQ_ID.match(low))
 
 
@@ -238,7 +251,7 @@ def canonicalize_title(value: str | None) -> str:
 
     s = _BRACKETED.sub(" ", s)
     s = _PARENTHETICAL.sub(
-        lambda m: " " if _is_noise_segment(m.group(1)) else m.group(0), s
+        lambda m: " " if _is_noise_segment(m.group(1), in_parens=True) else m.group(0), s
     )
 
     segments = _TITLE_SPLIT.split(s)

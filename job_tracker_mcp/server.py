@@ -681,9 +681,23 @@ rather than assuming you saw everything.
 
 STEP 2 — Extract postings, one email at a time.
 For each surviving message, call `apple-mail` get_message(message_id=<its id>,
-include_content=true) and extract every job posting it advertises. For each,
-capture: company, title, location, url (if present), and the source (the job
-board that sent the alert -- infer it from the sender).
+include_content=true). The body arrives under the "message" key, as PLAIN TEXT,
+not HTML. Extract every job posting it advertises.
+
+LinkedIn alerts look like this, repeated:
+
+    Director, Software Engineering (1139652)
+    The Judge Group · Chicago, IL
+    $186K-$248K / year          <- optional, its own line
+    Actively recruiting          <- noise; also "Easy Apply", "N company alumni"
+
+So: the TITLE is its own line; the next line is "Company · Location", separated
+by a middle dot; salary and badges are separate lines. Take the location from
+the COMPANY line, not the title. Indeed and Built In differ -- read what is
+there rather than assuming this shape.
+
+For each posting capture: company, title, location, url (if present), and the
+source (the job board -- infer it from the sender address).
 
 Copy the strings VERBATIM. Do not tidy them. "Acme, Inc." stays "Acme, Inc.";
 "Staff Engineer (Remote) [R-1234]" keeps its decorations; "Remote, US" stays as

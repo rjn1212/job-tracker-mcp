@@ -35,12 +35,22 @@ def test_fresh_db_is_current(db):
 def test_migration_v1_to_current(tmp_path):
     p = tmp_path / "v1.db"
     make_v1_db(p)
-    before = sqlite3.connect(str(p)).execute("SELECT * FROM jobs").fetchone()
+    c = sqlite3.connect(str(p)); c.row_factory = sqlite3.Row
+    before = c.execute("SELECT * FROM jobs").fetchone()
+    c.close()
 
     d = Database(db_path=p)
     assert d.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     after = d.conn.execute("SELECT * FROM jobs").fetchone()
-    assert tuple(after) == tuple(before)          # the job survived byte-identical
+
+    # Every field survives. The id is REBUILT, because the v1 fixture used a
+    # placeholder id and v5->v6 recomputes ids from the current canonicalizers.
+    from job_tracker_mcp.models import generate_job_id
+    assert after["id"] == generate_job_id(after["company"], after["title"], after["location"])
+    for col in ("company", "title", "location", "status", "date_applied", "notes",
+                "date_seen", "times_seen", "created_at"):
+        assert after[col] == before[col], col
+
     names = {r[0] for r in d.conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"onenote_pages", "onenote_links", "onenote_state"} <= names
@@ -240,3 +250,47 @@ def test_search_snippets_not_bodies(db):
     assert out["total"] == 1
     assert out["pages"][0]["snippets"] == ["I applied to Acme on 7/2"]
     assert "content_text" not in out["pages"][0]
+
+
+# ------------------------------------------- id rebuild after a canon change
+
+def test_id_rebuild_carries_links_and_merge_pointers(db):
+    """Changing canonicalize_title changes ids. Links and merged_into must follow."""
+    from job_tracker_mcp.models import generate_job_id
+    store = OneNoteStore(db)
+    r = db.add_job(company="Acme", title="Director, Software Engineering", location="Remote")
+    real_id = r["id"]
+    _page(store)
+    store.add_link("p1", real_id, "manual", 1.0)
+
+    # Simulate a row keyed under an older canonicalizer.
+    stale = "0000000000000000"
+    db.conn.execute("PRAGMA defer_foreign_keys = ON")
+    db.conn.execute("UPDATE onenote_links SET job_id = ? WHERE job_id = ?", (stale, real_id))
+    db.conn.execute("UPDATE jobs SET id = ? WHERE id = ?", (stale, real_id))
+    db.conn.commit()
+
+    out = db.rebuild_ids()
+    assert out["lost"] == 0
+    assert db.get_job(real_id)["title"] == "Director, Software Engineering"
+    assert store.links()[0]["job_id"] == real_id          # evidence followed the id
+
+
+def test_id_rebuild_is_idempotent(db):
+    db.add_job(company="Acme", title="Staff Engineer", location="Remote")
+    assert db.rebuild_ids()["lost"] == 0
+    assert db.rebuild_ids()["lost"] == 0
+
+
+def test_id_rebuild_refuses_to_guess_on_collision(db):
+    """Two rows that now canonicalize identically must not be silently merged."""
+    import pytest
+    a = db.add_job(company="Acme", title="Director, Software Engineering", location="Remote")
+    db.conn.execute("PRAGMA defer_foreign_keys = ON")
+    db.conn.execute(
+        "UPDATE jobs SET id = ?, title = ? WHERE id = ?",
+        ("1111111111111111", "Director, Software Engineering (1139652)", a["id"]))
+    db.conn.commit()
+    db.add_job(company="Acme", title="Director, Software Engineering", location="Remote")
+    with pytest.raises(RuntimeError, match="collide"):
+        db.rebuild_ids()
