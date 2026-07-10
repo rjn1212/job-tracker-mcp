@@ -305,7 +305,7 @@ def test_importing_server_does_not_open_the_live_database():
     assert server.db.path.resolve() != live
 
 
-def test_triage_prompt_describes_all_three_board_layouts():
+def test_triage_prompt_describes_the_board_layouts():
     """Built In inverts the order: company before title. Assume nothing."""
     from job_tracker_mcp.server import triage_job_alerts
     body = triage_job_alerts()
@@ -314,4 +314,17 @@ def test_triage_prompt_describes_all_three_board_layouts():
     assert "COMPANY FIRST" in body                  # Built In's inversion
     assert "SEVERAL POSTINGS" in body               # never stop at the first
     assert "never trust the subject line" in body   # Indeed names one of five
-    assert "Location is NEVER part of the title" in body
+
+
+def test_triage_prompt_covers_every_sender_and_trap():
+    """Five senders, four layouts, and two ways to misread them."""
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    for sender in ("LinkedIn Job Alerts", "LinkedIn Job Recommendations",
+                   "Indeed", "Built In", "jobs2web"):
+        assert sender in body, sender
+    assert "COMPANY FIRST" in body                    # Built In's inversion
+    assert "STOP AT THE FOOTER" in body               # the signature looks like a title
+    assert "intended for Randy Nelson" in body        # names the exact trap line
+    assert 'append " (Remote)" to the location' in body
+    assert "SEVERAL POSTINGS" in body

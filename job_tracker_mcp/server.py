@@ -688,13 +688,15 @@ EVERY ALERT CONTAINS SEVERAL POSTINGS -- typically five. Never stop at the first
 one, and never trust the subject line: Indeed's subject names one job and the
 body holds five. Count what you extracted and say so.
 
-The three boards use three different layouts. Read what is there; do not assume.
+Five senders appear in this mailbox, with FOUR different layouts. Read what is
+there; do not assume.
 
-  LinkedIn -- title first, then company and location joined by a middle dot:
+  LinkedIn Job Alerts AND LinkedIn Job Recommendations -- identical layout.
+  Title first, then company and location joined by a middle dot:
       Director, Software Engineering (1139652)
       The Judge Group · Chicago, IL
       $186K-$248K / year            <- optional, own line
-      Actively recruiting           <- noise; also "Easy Apply", "N alumni"
+      Easy Apply                    <- noise; also "Actively recruiting", "N alumni"
 
   Indeed -- title, company, location, salary, each on its own line:
       Senior Product Manager
@@ -709,13 +711,34 @@ The three boards use three different layouts. Read what is there; do not assume.
       Senior Engineering Manager API Platform
       In Office | Multiple Locations
       $118,450-$260,590             <- optional
+  Built In separates work-type from location with an invisible character
+  (U+FFFC, often a box). "In Office", "Remote", "Hybrid" are the work type;
+  the rest is the location. Ignore the box characters.
 
-Built In separates the work-type from the location with an invisible character
-(U+FFFC, often rendered as a box). Treat "In Office", "Remote" and "Hybrid" as
-the work type and the rest as the location. Ignore the box characters.
+  Direct-from-company notifications (e.g. jobs2web.com) -- ONE job, and the
+  company is named NOWHERE except the sender domain and the preamble:
+      From: fitchgroupincp-jobnotification@noreply12.jobs2web.com
+      "You are receiving this email because you joined the Fitch Group..."
+      Software Engineering, Full Stack - AI - Chicago, IL, US
+  Here the single line is "<title> - <City, ST, Country>". Take the company from
+  the preamble or the domain. Set source to the company, not to a job board.
 
-Location is NEVER part of the title on any of these boards. Take it from the
-company line (LinkedIn), its own line (Indeed), or the work-type line (Built In).
+TWO TRAPS.
+
+1. STOP AT THE FOOTER. Extraction ends at "See all jobs", "View all jobs" or
+   "GET MORE RECOMMENDATIONS". Below that, LinkedIn prints
+   "This email was intended for Randy Nelson (SVP - Senior Manager of Software
+   Engineering)" -- which looks exactly like a job title and is not one.
+
+2. "(Remote)" SOMETIMES SITS IN THE TITLE. LinkedIn writes both
+   "Director, Software Engineering (Remote)" with location "Oak Brook, IL", and
+   "Head of Software Engineering" with location "Chicago, IL (Remote)". Same
+   fact, two places. When the TITLE says (Remote) and the location line names a
+   city with no remote marker, append " (Remote)" to the location you pass, so
+   both spellings reach the same row. Leave the title alone -- the server strips
+   "(Remote)" from titles itself.
+
+Location is NEVER part of the company line's job title on any of these boards.
 
 Copy the strings VERBATIM. Do not tidy them. "Acme, Inc." stays "Acme, Inc.";
 "Staff Engineer (Remote) [R-1234]" keeps its decorations; "Remote, US" stays as
