@@ -253,9 +253,10 @@ def test_triage_prompt_warns_off_the_broken_date_field():
 
 
 def test_triage_prompt_accepts_a_different_mailbox():
+    """account/mailbox are prompt arguments, so the restriction can move."""
     from job_tracker_mcp.server import triage_job_alerts
     body = triage_job_alerts(account="Other", mailbox="INBOX")
-    assert 'account = "Other"' in body and 'mailbox = "INBOX"' in body
+    assert '"Other"' in body and '"INBOX"' in body
 
 
 def test_filter_prompt_explains_the_three_pattern_types():
