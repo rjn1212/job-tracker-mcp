@@ -8,6 +8,7 @@ condition (missing id, bad status, invalid transition) -- those return
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -33,7 +34,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -100,6 +101,14 @@ CREATE INDEX IF NOT EXISTS idx_jobs_date_seen ON jobs(date_seen);
 CREATE INDEX IF NOT EXISTS idx_jobs_source    ON jobs(source);
 CREATE INDEX IF NOT EXISTS idx_jobs_merged    ON jobs(merged_into);
 CREATE INDEX IF NOT EXISTS idx_jobs_triage    ON jobs(status, fit_score DESC, date_seen DESC);
+
+-- Small key/value store for the server's own bookkeeping. Currently: the
+-- high-water mark of the last triage run, per mailbox.
+CREATE TABLE IF NOT EXISTS app_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT NOT NULL
+);
 """
 
 # Unscored jobs sort last: SQLite has no NULLS LAST. The trailing id makes the
@@ -189,7 +198,8 @@ class Database:
         transactions -- which is why the v3 step guards its ALTER by hand:
         `CREATE TABLE IF NOT EXISTS` is re-runnable, `ADD COLUMN` is not.
         """
-        steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3}
+        steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
+                 3: self._migrate_3_to_4}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -208,6 +218,12 @@ class Database:
         # page hierarchy. Persist it.
         if not self._has_column("onenote_pages", "page_order"):
             self.conn.execute("ALTER TABLE onenote_pages ADD COLUMN page_order INTEGER")
+
+    def _migrate_3_to_4(self) -> None:
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_state ("
+            "  key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
+        )
 
     # ----------------------------------------------------------- validation
 
@@ -585,6 +601,92 @@ class Database:
 
         return {"jobs": [row_to_job(r) for r in rows], "total": total,
                 "offset": offset, "limit": limit}
+
+    # ------------------------------------------------------ triage watermark
+
+    @staticmethod
+    def _watermark_key(account: str, mailbox: str) -> str:
+        return f"triage:{normalize_key_part(account)}:{normalize_key_part(mailbox)}"
+
+    @staticmethod
+    def _bad_datetime(value: str) -> str | None:
+        try:
+            datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return (f"Invalid datetime {value!r}. Expected ISO 8601, e.g. "
+                    f"'2026-07-09T17:33:43-05:00'.")
+        return None
+
+    def get_triage_state(self, account: str, mailbox: str) -> dict:
+        """Where the last triage run stopped, for this mailbox."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT value, updated_at FROM app_state WHERE key = ?",
+                (self._watermark_key(account, mailbox),),
+            ).fetchone()
+        if row is None:
+            return {"account": account, "mailbox": mailbox,
+                    "last_message_dt": None, "has_run": False,
+                    "message": "No triage run recorded for this mailbox. Process "
+                               "every message; there is no watermark yet."}
+        state = json.loads(row["value"])
+        return {"account": account, "mailbox": mailbox, "has_run": True,
+                **state, "recorded_at": row["updated_at"]}
+
+    def record_triage_run(self, account: str, mailbox: str, last_message_dt: str,
+                          emails_processed: int = 0, postings_seen: int = 0) -> dict:
+        """Advance the watermark to the newest message ACTUALLY processed.
+
+        Two invariants:
+
+        - It never moves backward. Re-running an older slice of mail must not
+          erase progress.
+        - It is the newest message *processed*, never "now". Mail arriving
+          mid-run has a later date_received and must be caught next time, not
+          skipped because the clock moved past it.
+
+        Overlap is safe, gaps are not: the next run re-reads the watermark
+        message inclusively. add_job is idempotent and a re-sighting keeps the
+        earliest date_seen, so reprocessing costs nothing.
+        """
+        if msg := self._bad_datetime(last_message_dt):
+            return _err(msg)
+
+        def inst(s):
+            # ISO 8601 with offsets does not sort lexically across zones.
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+        key = self._watermark_key(account, mailbox)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT value FROM app_state WHERE key = ?", (key,)
+            ).fetchone()
+            prev = json.loads(row["value"]) if row else {}
+            previous_dt = prev.get("last_message_dt")
+
+            newest = last_message_dt
+            if previous_dt and inst(previous_dt) > inst(last_message_dt):
+                newest = previous_dt
+
+            state = {
+                "last_message_dt": newest,
+                "last_run_at": now_str(),
+                "emails_processed": emails_processed,
+                "postings_seen": postings_seen,
+                "total_runs": prev.get("total_runs", 0) + 1,
+            }
+            self.conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, json.dumps(state), now_str()),
+            )
+
+        advanced = newest != previous_dt
+        return {"result": "recorded", **state,
+                "message": (f"Watermark {'advanced to' if advanced else 'held at'} "
+                            f"{newest}. Next run should read messages with "
+                            f"date_received >= {newest} (inclusive; duplicates are free).")}
 
     # ------------------------------------------------ reconciliation reads
 

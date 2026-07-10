@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from job_tracker_mcp.database import SCHEMA_SQL, Database
+from job_tracker_mcp.database import SCHEMA_SQL, SCHEMA_VERSION, Database
 from job_tracker_mcp.onenote.store import OneNoteStore
 
 
@@ -25,7 +25,7 @@ def make_v1_db(path):
 
 
 def test_fresh_db_is_current(db):
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     names = {r[0] for r in db.conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"jobs", "rejected_patterns", "onenote_pages",
@@ -38,7 +38,7 @@ def test_migration_v1_to_current(tmp_path):
     before = sqlite3.connect(str(p)).execute("SELECT * FROM jobs").fetchone()
 
     d = Database(db_path=p)
-    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     after = d.conn.execute("SELECT * FROM jobs").fetchone()
     assert tuple(after) == tuple(before)          # the job survived byte-identical
     names = {r[0] for r in d.conn.execute(
@@ -61,7 +61,7 @@ def test_migration_is_idempotent(tmp_path):
     conn.close()
 
     d = Database(db_path=p)                        # must not raise
-    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert d.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
     assert d._has_column("onenote_pages", "page_order")
     d.close()

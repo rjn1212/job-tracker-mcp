@@ -309,6 +309,33 @@ it would have caught. A pattern that catches a job you applied to is a bad one.
 Patterns apply at **insert time only** — adding one never retroactively rejects
 what's already tracked.
 
+### Where triage left off
+
+`get_triage_state(account, mailbox)` returns the `date_received` of the newest
+alert email already processed; `record_triage_run(...)` advances it. The
+watermark lives in the `app_state` table, per mailbox — not in the prompt,
+because a number the model has to remember is a number it will eventually get
+wrong.
+
+The first run reports `has_run: false`, meaning "process everything." Every run
+after that reads `date_received >= last_message_dt`, **inclusively**.
+
+Inclusive is the whole design. Re-reading the boundary email is free — `add_job`
+is idempotent and a re-sighting keeps the earliest `date_seen`. A gap is not
+free: it loses a job silently, and nothing ever goes back for it. **Overlap is
+cheap; gaps are permanent.**
+
+Two invariants the tools enforce, so the prompt can't get them wrong:
+
+- The watermark **never moves backward**. Re-running an older slice of mail can't
+  erase progress. Comparison is by *instant*, not by string — `2026-07-09T23:00Z`
+  looks later than `2026-07-09T19:00-05:00` lexically, and is actually an hour
+  earlier.
+- It records the newest message **actually processed**, never "now". Mail that
+  arrives mid-run has a later `date_received` and must be caught next time, not
+  skipped because the clock moved past it. And a failed run must not record at
+  all.
+
 ### When a job first appeared
 
 `date_seen` is the date the posting first showed up, and it must come from the

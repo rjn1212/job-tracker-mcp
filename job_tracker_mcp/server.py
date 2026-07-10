@@ -337,6 +337,41 @@ def search_jobs(
     return db.search_jobs(query, status, limit, offset)
 
 
+@mcp.tool
+@_tool_guard
+def get_triage_state(account: str, mailbox: str) -> dict:
+    """Where the last triage run stopped for this mailbox. Call this FIRST.
+
+    Returns `last_message_dt` -- the date_received of the newest alert email
+    already processed -- or has_run=false if this mailbox has never been
+    triaged, in which case process everything.
+
+    Read messages with date_received >= last_message_dt, INCLUSIVELY. Re-reading
+    the boundary message is free: add_job is idempotent and a re-sighting keeps
+    the earliest date_seen. A gap is not free -- it loses a job silently.
+    """
+    return db.get_triage_state(account, mailbox)
+
+
+@mcp.tool
+@_tool_guard
+def record_triage_run(account: str, mailbox: str, last_message_dt: str,
+                      emails_processed: int = 0, postings_seen: int = 0) -> dict:
+    """Advance the watermark. Call this LAST, only after every posting is filed.
+
+    `last_message_dt` must be the date_received of the NEWEST email you actually
+    processed -- copied verbatim from search_messages, offset and all. Never
+    "now": mail that arrived while you were working has a later date_received
+    and must be picked up next time, not skipped because the clock moved.
+
+    If the run failed partway, do not call this. A watermark that ran ahead of
+    the work silently loses every email in between. The watermark never moves
+    backward, so a partial re-run of older mail cannot erase progress.
+    """
+    return db.record_triage_run(account, mailbox, last_message_dt,
+                                emails_processed, postings_seen)
+
+
 # ---------------------------------------------------------------------------
 # Part 2: OneNote. Tools 16-25.
 #
@@ -535,9 +570,9 @@ def triage_job_alerts(
     Reads job alert emails via the `apple-mail` server, files every posting
     through this `job-tracker` server, and reports what needs a human.
     """
-    window = (f"Keep only messages whose date_received is on or after {since}."
-              if since else
-              "Keep only messages whose date_received is within the last 7 days.")
+    override = (f"\n    The user overrode the watermark: use since = {since} instead of\n"
+                f"    last_message_dt, but STILL record the run at the end.\n"
+                if since else "")
     return f"""\
 Triage my job alert emails. Follow these steps in order. Do not improvise.
 
@@ -546,25 +581,41 @@ Two MCP servers are involved, by these exact names:
                      get_message, get_attachments.
   - `job-tracker`  : this server. Everything else below.
 
-STEP 1 — Find the alerts.
+STEP 0 — Find out where you left off.
+Call `job-tracker` get_triage_state(account="{account}", mailbox="{mailbox}").
+
+  - has_run = false  -> this mailbox has never been triaged. Process EVERY
+                        message in it. This is the first full pass.
+  - has_run = true   -> process only messages whose date_received is
+                        >= last_message_dt, INCLUSIVE of that boundary message.
+
+Inclusive is deliberate. Re-reading the boundary email is free, because add_job
+is idempotent and a re-sighting keeps the earliest date_seen. A gap is not free:
+it silently loses a job. When in doubt, overlap.
+{override}
+STEP 1 — Fetch the alerts.
 Call `apple-mail` search_messages with EXACTLY:
     account = "{account}"
     mailbox = "{mailbox}"
     limit   = {max_emails}
 Both `account` and `mailbox` are mandatory -- that build is restricted to this
-one mailbox and will return an "access restricted" error for any other.
+one mailbox and returns "access restricted" for any other. `limit` may go up to
+1000; raise it for the first full pass.
 
 search_messages has NO date filter. It returns
 {{account, mailbox, count, messages[]}}, where each message has:
     id, subject, sender, date_received, date_sent, read_status, flagged
 
-{window} Filter in your head, after the call.
+Apply the STEP 0 cutoff yourself, after the call.
 
 USE `date_received`, NEVER `date_sent`. date_sent is unset in this mailbox and
 comes back as "0001-01-01T00:00:00Z". date_received looks like
 "2026-07-09T17:33:43-05:00" -- it already carries the local offset, so its first
 ten characters are the local calendar date. Take that YYYY-MM-DD directly; do
 not convert it.
+
+If `count` equals your `limit`, there may be more mail than you fetched. Say so
+rather than assuming you saw everything.
 
 STEP 2 — Extract postings, one email at a time.
 For each surviving message, call `apple-mail` get_message(message_id=<its id>,
@@ -614,6 +665,24 @@ STEP 6 — Report, in prose, in this order:
      things it should not, say so.
   4. Any possible_duplicates you did not resolve, and why.
   5. get_stats(): the total, the by_status counts, and unscored_new.
+
+STEP 7 — Record where you stopped. Do this LAST.
+Call `job-tracker` record_triage_run with:
+    account          = "{account}"
+    mailbox          = "{mailbox}"
+    last_message_dt  = the date_received of the NEWEST message you actually
+                       processed, copied verbatim, offset and all.
+    emails_processed = how many you read
+    postings_seen    = how many postings you filed
+
+Never pass "now" as last_message_dt. Mail that arrived while you were working
+has a later date_received, and a watermark set to the clock would skip it
+forever.
+
+If anything went wrong -- a tool errored, you could not read an email, you ran
+out of context -- DO NOT call record_triage_run. Tell me what failed. A
+watermark that ran ahead of the work silently loses every email in between, and
+nothing will ever go back for them.
 
 Never call mark_applied. Applying is something I do, and I will tell you.
 Never call add_rejected_pattern on your own initiative. Suggest it; I decide.

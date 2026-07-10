@@ -1,5 +1,6 @@
 import pytest
 
+from job_tracker_mcp.database import SCHEMA_VERSION
 from job_tracker_mcp.models import (
     canonicalize_company,
     canonicalize_location,
@@ -428,7 +429,7 @@ def test_get_stats(db):
 
 
 def test_schema_version_set(db):
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 # --------------------------------------------------- company / title keys
@@ -671,3 +672,64 @@ def test_bulk_add_jobs_carries_date_seen(db):
     ])
     assert out["created"] == 1
     assert db.get_jobs()["jobs"][0]["date_seen"] == "2026-05-05"
+
+
+# ------------------------------------------------------- triage watermark
+
+ACCT, MBOX = "RandyN Exchange", "Job_Alerts_Viewed"
+
+
+def test_triage_state_absent_means_process_everything(db):
+    s = db.get_triage_state(ACCT, MBOX)
+    assert s["has_run"] is False
+    assert s["last_message_dt"] is None
+    assert "every message" in s["message"]
+
+
+def test_record_and_read_watermark(db):
+    out = db.record_triage_run(ACCT, MBOX, "2026-07-09T17:33:43-05:00", 3, 40)
+    assert out["result"] == "recorded"
+    s = db.get_triage_state(ACCT, MBOX)
+    assert s["has_run"] is True
+    assert s["last_message_dt"] == "2026-07-09T17:33:43-05:00"
+    assert s["emails_processed"] == 3 and s["postings_seen"] == 40
+    assert s["total_runs"] == 1
+
+
+def test_watermark_never_moves_backward(db):
+    """Re-running an older slice of mail must not erase progress."""
+    db.record_triage_run(ACCT, MBOX, "2026-07-09T17:33:43-05:00")
+    db.record_triage_run(ACCT, MBOX, "2026-07-01T09:00:00-05:00")
+    assert db.get_triage_state(ACCT, MBOX)["last_message_dt"] == "2026-07-09T17:33:43-05:00"
+    assert db.get_triage_state(ACCT, MBOX)["total_runs"] == 2
+
+
+def test_watermark_compares_instants_not_strings(db):
+    """ISO 8601 with offsets does not sort lexically across time zones.
+
+    "2026-07-09T23:00:00+00:00" is EARLIER than "2026-07-09T19:00:00-05:00"
+    (00:00 UTC) but sorts LATER as a string.
+    """
+    db.record_triage_run(ACCT, MBOX, "2026-07-09T19:00:00-05:00")   # 00:00Z Jul 10
+    db.record_triage_run(ACCT, MBOX, "2026-07-09T23:00:00+00:00")   # 23:00Z Jul 09
+    assert db.get_triage_state(ACCT, MBOX)["last_message_dt"] == "2026-07-09T19:00:00-05:00"
+
+
+def test_watermark_is_per_mailbox(db):
+    db.record_triage_run(ACCT, MBOX, "2026-07-09T17:33:43-05:00")
+    assert db.get_triage_state(ACCT, "INBOX")["has_run"] is False
+
+
+def test_watermark_key_is_case_insensitive(db):
+    db.record_triage_run(ACCT, MBOX, "2026-07-09T17:33:43-05:00")
+    assert db.get_triage_state("randyn  exchange", "job_alerts_viewed")["has_run"] is True
+
+
+def test_record_triage_run_validates_the_datetime(db):
+    out = db.record_triage_run(ACCT, MBOX, "yesterday")
+    assert "error" in out
+    assert db.get_triage_state(ACCT, MBOX)["has_run"] is False   # nothing written
+
+
+def test_record_triage_run_accepts_a_z_suffix(db):
+    assert db.record_triage_run(ACCT, MBOX, "2026-07-09T22:33:43Z")["result"] == "recorded"

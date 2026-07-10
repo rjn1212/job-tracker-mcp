@@ -49,7 +49,7 @@ def test_import_without_client_id(tmp_path):
     r = _fresh_import({"JOB_TRACKER_DB": str(tmp_path / "t.db")}, IMPORT_AND_COUNT)
     assert r.returncode == 0, r.stderr
     assert r.stdout == ""
-    assert "TOOLS=25" in r.stderr
+    assert "TOOLS=27" in r.stderr
 
 
 def test_database_constructor_imports_no_network_stack(tmp_path):
@@ -265,3 +265,19 @@ def test_filter_prompt_explains_the_three_pattern_types():
         assert kind in body
     assert "STILL STORED" in body                # filtered jobs are kept
     assert "WAIT for me to approve" in body      # never installs unilaterally
+
+
+def test_triage_prompt_uses_the_watermark():
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    assert "get_triage_state" in body
+    assert "record_triage_run" in body
+    assert "INCLUSIVE" in body                   # overlap is free, gaps are not
+    assert "Never pass \"now\"" in body
+    assert "DO NOT call record_triage_run" in body   # never advance past a failure
+
+
+def test_triage_prompt_since_overrides_watermark():
+    from job_tracker_mcp.server import triage_job_alerts
+    assert "overrode the watermark" in triage_job_alerts(since="2026-07-01")
+    assert "overrode the watermark" not in triage_job_alerts()
