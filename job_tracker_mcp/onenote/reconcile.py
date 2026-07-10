@@ -118,17 +118,40 @@ def normalize_date(raw: str, default_year: int) -> str | None:
     return None
 
 
+# A first line that is NOTHING BUT a date, as on the Zoro page:
+#     15-Jun-2026
+#     Sr. Manager, Software Engineering
+# Deliberately anchored and total: "R243298" and "Rob Bishop" must not match, and
+# a date buried in a job description ("candidates with 10/10/2020 experience")
+# must never be mistaken for the day you applied.
+_BARE_DATE_LINE = re.compile(
+    r"^\s*(\d{4}-\d{2}-\d{2}|\d{1,2}-[A-Za-z]{3,9}-\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*$"
+)
+
+
+def _first_line_date(text: str, default_year: int) -> str | None:
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            continue
+        m = _BARE_DATE_LINE.match(line)
+        return normalize_date(m.group(1), default_year) if m else None
+    return None
+
+
 def extract_applied_date(text: str, default_year: int) -> tuple[str | None, str | None]:
     """The date the page says you applied, and which label it came from.
 
-    "Applied:" first, then "Date:". Returns (None, None) when neither yields a
-    parseable date -- the caller then falls back to the page's creation date,
-    which is when the note was written, not necessarily when you applied.
+    "Applied:", then "Date:", then a bare date alone on the first line. Returns
+    (None, None) when none of those yields a date -- the caller then falls back
+    to the page's creation date, which is when the note was written rather than
+    when the application happened, and is reported as such.
     """
     for source, pat in (("applied", _APPLIED_LABEL), ("date", _DATE_LABEL)):
         for m in pat.finditer(text or ""):
             if parsed := normalize_date(m.group(1), default_year):
                 return parsed, source
+    if parsed := _first_line_date(text, default_year):
+        return parsed, "first_line"
     return None, None
 
 

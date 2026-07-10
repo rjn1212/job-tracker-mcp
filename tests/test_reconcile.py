@@ -320,15 +320,36 @@ def test_candidates_does_not_masquerade_as_a_date_label():
     assert extract_applied_date(text, 2026) == (None, None)
 
 
-def test_no_label_falls_back_to_page_creation_date():
+def test_bare_date_on_first_line_is_used():
+    """The Zoro page: a date alone on line 1, then the role. No label."""
     jobs = [job("a1", "Zoro", "Sr. Manager, Software Engineering")]
     p = PageRecord(page_id="p1", title="Zoro - Sr. Manager, Software Engineering",
                    text="15-Jun-2026\nSr. Manager, Software Engineering",
                    created_dt="2026-06-16T00:00:00Z", page_order=1)
     r = match_pages([p], jobs, [])
     e = r.onenote_only[0]
-    assert e["date_applied"] == "2026-06-16"
-    assert e["date_source"] == "page_created"     # an unlabelled body date is not trusted
+    assert e["date_applied"] == "2026-06-15"      # the page, not its creation date
+    assert e["date_source"] == "first_line"
+
+
+@pytest.mark.parametrize("first_line", [
+    "R243298",                     # Capital One: a req id, not a date
+    "Rob Bishop",                  # Mitr: a recruiter's name
+    "Applied on 15-Jun-2026",      # prose around a date is not a bare date line
+    "Salary 100000-200000-2026",
+])
+def test_first_line_must_be_nothing_but_a_date(first_line):
+    assert extract_applied_date(f"{first_line}\nmore text", 2026) == (None, None)
+
+
+def test_no_date_anywhere_falls_back_to_page_creation():
+    jobs = [job("a1", "Capital One", "Senior Lead Software Engineer")]
+    p = PageRecord(page_id="p1", title="Capital One - Senior Lead Software Engineer",
+                   text="R243298\nSenior Lead Software Engineer, Full Stack",
+                   created_dt="2026-07-08T00:00:00Z", page_order=1)
+    r = match_pages([p], jobs, [])
+    assert r.onenote_only[0]["date_applied"] == "2026-07-08"
+    assert r.onenote_only[0]["date_source"] == "page_created"
 
 
 def test_date_source_is_reported():
