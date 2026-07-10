@@ -200,7 +200,7 @@ def test_prompts_are_registered_and_documented():
     from job_tracker_mcp import server
     prompts = asyncio.run(server.mcp.list_prompts())
     names = {p.name for p in prompts}
-    assert names == {"triage_job_alerts", "setup_job_filters"}
+    assert names == {"triage_job_alerts", "setup_job_filters", "review_new_jobs"}
     assert all(p.description for p in prompts)
 
 
