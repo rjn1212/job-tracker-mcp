@@ -129,9 +129,30 @@ def test_country_suffix_dropped(db):
     add(db, location="Austin, TX, USA")
     add(db, location="Austin, TX")
     assert db.get_stats()["total_jobs"] == 1
-    # Documented limitation, pinned so that changing it is deliberate.
-    add(db, location="Austin, Texas")
-    assert db.get_stats()["total_jobs"] == 2
+
+
+def test_state_name_and_abbreviation_are_the_same_place(db):
+    """LinkedIn's saved-job mail writes "Chicago, Illinois, United States";
+    its job alerts write "Chicago, IL". Same job, one row."""
+    a = add(db, location="Chicago, Illinois, United States")
+    b = add(db, location="Chicago, IL")
+    assert a["id"] == b["id"] and b["result"] == "duplicate"
+    assert db.get_stats()["total_jobs"] == 1
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Chicago, Illinois, United States", "chicago il"),
+    ("Austin, Texas", "austin tx"),
+    ("New York, New York", "new york ny"),
+    ("Washington, District of Columbia", "washington dc"),
+    ("Kansas City, Kansas", "kansas city ks"),
+    # A bare state, or a city that IS a state name, must not collapse: nothing
+    # precedes it, so there is no city to keep.
+    ("New York", "new york"),
+    ("Illinois", "illinois"),
+])
+def test_trailing_state_name_becomes_its_abbreviation(raw, expected):
+    assert canonicalize_location(raw) == expected
 
 
 def test_location_canonical_stored(db):

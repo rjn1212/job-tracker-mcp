@@ -688,23 +688,36 @@ EVERY ALERT CONTAINS SEVERAL POSTINGS -- typically five. Never stop at the first
 one, and never trust the subject line: Indeed's subject names one job and the
 body holds five. Count what you extracted and say so.
 
-Five senders appear in this mailbox, with FOUR different layouts. Read what is
-there; do not assume.
+NINE senders appear in this mailbox. One is NOT a job alert. Read the sender
+first, then the layout. Do not assume.
 
-  LinkedIn Job Alerts AND LinkedIn Job Recommendations -- identical layout.
+  SKIP ENTIRELY -- LinkedIn <messages-noreply@linkedin.com>
+      Subject looks like "Vice President of Software Engineering insights:
+      $250K/yr+". It is a salary-trends newsletter. It lists COMPANIES with
+      "1 job opening" and job titles under "People with similar roles applied
+      to these jobs". Extracting from it files companies as jobs. Skip it.
+
+  LinkedIn Job Alerts / Job Recommendations / <jobs-noreply> -- same layout.
   Title first, then company and location joined by a middle dot:
       Director, Software Engineering (1139652)
       The Judge Group · Chicago, IL
       $186K-$248K / year            <- optional, own line
-      Easy Apply                    <- noise; also "Actively recruiting", "N alumni"
+      Easy Apply                    <- noise; also "Actively recruiting"
+  The <jobs-noreply> variant is a SAVED-JOBS reminder ("Your saved job at X is
+  still available"). Those are real postings; add them. It writes locations as
+  "Chicago, Illinois, United States" where the alerts write "Chicago, IL" --
+  pass either verbatim, the server normalizes states.
 
-  Indeed -- title, company, location, salary, each on its own line:
+  Indeed (jobalert.indeed.com AND match.indeed.com) -- one field per line:
+      Fully remote                  <- match.indeed.com ONLY, and it comes FIRST
       Senior Product Manager
       DocuSign
       Chicago, IL
       $140,100 - $206,775 a year    <- optional
       Degree in Computer Science... <- snippet; noise
-      Just posted                   <- noise; also "1 day ago", "Easily apply"
+      Just posted                   <- noise; also "Easily apply", "1 day ago"
+  On match.indeed.com a work-type line ("Fully remote") PRECEDES the title. If
+  present, fold it into the location.
 
   Built In -- COMPANY FIRST, then the title. The order is inverted:
       CVS Health
@@ -712,16 +725,24 @@ there; do not assume.
       In Office | Multiple Locations
       $118,450-$260,590             <- optional
   Built In separates work-type from location with an invisible character
-  (U+FFFC, often a box). "In Office", "Remote", "Hybrid" are the work type;
-  the rest is the location. Ignore the box characters.
+  (U+FFFC, often a box). "In Office", "Remote", "Hybrid" are the work type; the
+  rest is the location. Ignore the box characters.
 
-  Direct-from-company notifications (e.g. jobs2web.com) -- ONE job, and the
-  company is named NOWHERE except the sender domain and the preamble:
-      From: fitchgroupincp-jobnotification@noreply12.jobs2web.com
-      "You are receiving this email because you joined the Fitch Group..."
-      Software Engineering, Full Stack - AI - Chicago, IL, US
-  Here the single line is "<title> - <City, ST, Country>". Take the company from
-  the preamble or the domain. Set source to the company, not to a job board.
+  Direct-from-company mail -- Oracle Talent Acquisition <noreply@oracle.com>,
+  jobs2web.com, and others. The company is named NOWHERE except the sender and
+  the preamble. Two shapes seen:
+      Oracle: a bare list of titles, NO company and NO location lines:
+          Software Developer 4
+          Senior Software Developer
+      -> company = "Oracle", location = "Unknown", source = "Oracle".
+      jobs2web: one line, "<title> - <City, ST, Country>":
+          Software Engineering, Full Stack - AI - Chicago, IL, US
+      -> company = "Fitch Group" (from the preamble), split off the location.
+
+  WARNING on Oracle-style mail: it listed "Software Developer 4" TWICE. With no
+  location to tell them apart, those two requisitions collapse into one row with
+  times_seen=2. That is the honest result -- the email gives nothing to
+  distinguish them. Say so in your report rather than inventing a difference.
 
 TWO TRAPS.
 

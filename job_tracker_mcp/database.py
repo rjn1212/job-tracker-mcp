@@ -36,7 +36,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -222,7 +222,8 @@ class Database:
         """
         steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
                  3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
-                 5: self._rebuild_ids, 6: self._rebuild_ids}
+                 5: self._rebuild_ids, 6: self._rebuild_ids,
+                 7: self._rebuild_ids}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:

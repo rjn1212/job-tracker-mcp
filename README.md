@@ -107,7 +107,7 @@ Deliberately **not** collapsed, because the difference is real:
 | `Senior Staff Engineer`, `Staff Engineer II`, `Staff Engineer, Platform` | seniority and specialization are meaningful |
 | `Remote - EMEA` vs `Remote, US` | you can't take the EMEA one |
 | `Hybrid - Remote 2 days` vs `Remote` | not fully remote |
-| `Austin, TX` vs `Austin, Texas` | expanding abbreviations needs a gazetteer; `IN`/`OR`/`ME` are states *and* words |
+| `Remote - EMEA` vs `Remote, US` | you can't take the EMEA one |
 
 Re-adding a job records a re-sighting (`times_seen`, `last_seen`) and never
 overwrites your `fit_score`, `status`, or `notes`.

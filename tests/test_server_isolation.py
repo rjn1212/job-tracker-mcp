@@ -317,14 +317,34 @@ def test_triage_prompt_describes_the_board_layouts():
 
 
 def test_triage_prompt_covers_every_sender_and_trap():
-    """Five senders, four layouts, and two ways to misread them."""
+    """Nine senders, five layouts, one to skip, and three ways to misread them."""
     from job_tracker_mcp.server import triage_job_alerts
     body = triage_job_alerts()
-    for sender in ("LinkedIn Job Alerts", "LinkedIn Job Recommendations",
-                   "Indeed", "Built In", "jobs2web"):
+    for sender in ("LinkedIn Job Alerts", "Job Recommendations",
+                   "Indeed", "Built In", "jobs2web", "Oracle"):
         assert sender in body, sender
     assert "COMPANY FIRST" in body                    # Built In's inversion
     assert "STOP AT THE FOOTER" in body               # the signature looks like a title
     assert "intended for Randy Nelson" in body        # names the exact trap line
     assert 'append " (Remote)" to the location' in body
     assert "SEVERAL POSTINGS" in body
+
+
+def test_triage_prompt_skips_the_salary_trends_newsletter():
+    """messages-noreply is not a job alert. It lists companies, not postings."""
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    assert "SKIP ENTIRELY" in body
+    assert "messages-noreply@linkedin.com" in body
+    assert "files companies as jobs" in body
+
+
+def test_triage_prompt_covers_the_new_senders():
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    for s in ("match.indeed.com", "jobalert.indeed.com", "noreply@oracle.com",
+              "jobs2web.com", "jobs-noreply"):
+        assert s in body, s
+    assert "PRECEDES the title" in body        # match.indeed's work-type line
+    assert "NO company and NO location" in body  # Oracle's bare title list
+    assert "times_seen=2" in body              # honest about the Oracle collapse

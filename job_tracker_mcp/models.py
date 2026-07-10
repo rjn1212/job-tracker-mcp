@@ -139,6 +139,45 @@ _REMOTE_QUALIFIERS = frozenset({
 # and "Austin, TX" collide.
 _COUNTRY_TOKENS = frozenset({"us", "usa", "u.s.", "u.s.a.", "united", "states", "america"})
 
+# LinkedIn's saved-job mails write "Chicago, Illinois, United States"; its job
+# alerts write "Chicago, IL". Same place, two rows.
+#
+# Only the NAME -> ABBREVIATION direction is done, and it is unambiguous: fifty
+# states plus DC, a closed list, not a gazetteer. The reverse would not be --
+# "IN", "OR" and "ME" are states AND English words, which is why
+# canonicalize_title never touches them.
+_STATE_ABBREV = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
+    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
+    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny",
+    "north carolina": "nc", "north dakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhode island": "ri",
+    "south carolina": "sc", "south dakota": "sd", "tennessee": "tn", "texas": "tx",
+    "utah": "ut", "vermont": "vt", "virginia": "va", "washington": "wa",
+    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy",
+    "district of columbia": "dc",
+}
+_MAX_STATE_TOKENS = 3
+
+
+def _abbreviate_trailing_state(tokens: list[str]) -> list[str]:
+    """"chicago illinois" -> "chicago il". Requires a city before the state.
+
+    Without that guard, the city "New York" would collapse to "ny" while
+    "New York, NY" stays "new york ny" -- turning one fix into a new mismatch.
+    """
+    for n in range(_MAX_STATE_TOKENS, 0, -1):
+        if len(tokens) > n:                       # strictly: something precedes it
+            name = " ".join(tokens[-n:])
+            if abbrev := _STATE_ABBREV.get(name):
+                return tokens[:-n] + [abbrev]
+    return tokens
+
 
 def canonicalize_location(value: str | None) -> str:
     """Collapse the many spellings of a location into one canonical form.
@@ -170,6 +209,7 @@ def canonicalize_location(value: str | None) -> str:
     tokens = s.split()
     while tokens and tokens[-1] in _COUNTRY_TOKENS:
         tokens.pop()
+    tokens = _abbreviate_trailing_state(tokens)
     return " ".join(tokens) or "unknown"
 
 
