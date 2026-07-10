@@ -180,20 +180,29 @@ def canonicalize_location(value: str | None) -> str:
 # tracker that is nearly always correct and the information loss is acceptable;
 # for anything doing entity resolution across real corporate structures it
 # would not be.
+# NOT "group" or "holdings": those are parts of a name, not legal-entity
+# suffixes. Stripping them turns "The Judge Group" into "the judge" and
+# "Baker Tilly Advisory Group, LP" into "baker tilly advisory", merging
+# distinct employers and mangling the display string.
 _LEGAL_SUFFIXES = frozenset({
     "inc", "incorporated", "llc", "l.l.c", "ltd", "limited", "corp",
     "corporation", "co", "company", "gmbh", "plc", "lp", "llp", "pllc",
     "sa", "nv", "bv", "ab", "ag", "as", "oy", "pty", "pbc", "srl", "kk",
-    "holdings", "group",
 })
 
 
 def canonicalize_company(value: str | None) -> str:
-    """Strip trailing legal-entity suffixes. "Acme, Inc." -> "acme"."""
+    """Strip a leading "The" and trailing legal-entity suffixes.
+
+    "Acme, Inc." -> "acme". "The Judge Group" -> "judge group", so that a board
+    writing "Judge Group" reaches the same row.
+    """
     s = normalize_key_part(value).replace(",", " ")
     tokens = _WS.sub(" ", s).strip().split()
     while tokens and tokens[-1].strip(".") in _LEGAL_SUFFIXES:
         tokens.pop()
+    if len(tokens) > 1 and tokens[0] == "the":
+        tokens.pop(0)
     # A company legitimately named e.g. "Limited" must not normalize to "".
     return " ".join(tokens) or normalize_key_part(value)
 
@@ -235,6 +244,18 @@ def _is_noise_segment(seg: str, in_parens: bool = False) -> bool:
     return bool(_PAY_RANGE.match(low) or _REQ_ID.match(low))
 
 
+# Indeed writes "Sr. Manager"; LinkedIn and Randy's notebook write "Senior
+# Manager". Same job, and without this, two rows. Whole tokens only, so
+# "Sr" inside a word is untouched. Deliberately NOT expanding "VP" ->
+# "Vice President": that direction is a tarpit ("SVP", "AVP", "EVP").
+_TITLE_ABBREV = {"sr": "senior", "sr.": "senior", "snr": "senior",
+                 "jr": "junior", "jr.": "junior"}
+
+
+def _expand_abbreviations(s: str) -> str:
+    return " ".join(_TITLE_ABBREV.get(tok, tok) for tok in s.split())
+
+
 def canonicalize_title(value: str | None) -> str:
     """Strip board decorations from a job title.
 
@@ -257,7 +278,7 @@ def canonicalize_title(value: str | None) -> str:
     segments = _TITLE_SPLIT.split(s)
     kept = [segments[0]] + [g for g in segments[1:] if not _is_noise_segment(g)]
     out = _WS.sub(" ", " ".join(kept)).strip(" ,-–—|")
-    return out or s.strip()
+    return _expand_abbreviations(out) or s.strip()
 
 
 def generate_job_id(company: str, title: str, location: str | None) -> str:

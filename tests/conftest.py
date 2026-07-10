@@ -1,4 +1,15 @@
+import os
 import socket
+import tempfile
+from pathlib import Path
+
+# MUST run before anything imports job_tracker_mcp.server, which constructs
+# `db = Database()` at module scope and would otherwise open -- and MIGRATE --
+# the real data/jobs.db. conftest is imported before any test module, so this
+# is the last moment it can be prevented. A test suite that silently upgrades
+# the user's live database is worse than a failing one.
+os.environ["JOB_TRACKER_DB"] = str(
+    Path(tempfile.mkdtemp(prefix="job-tracker-tests-")) / "test.db")
 
 import keyring
 import pytest
@@ -42,3 +53,11 @@ def _no_keychain(monkeypatch):
     """Never touch the real Keychain, and never block on its dialog."""
     monkeypatch.setattr(keyring, "get_password", lambda *a, **k: None)
     monkeypatch.setattr(keyring, "set_password", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_database():
+    """Guard the guard: JOB_TRACKER_DB must point somewhere disposable."""
+    p = Path(os.environ["JOB_TRACKER_DB"]).resolve()
+    real = (Path(__file__).resolve().parent.parent / "data" / "jobs.db").resolve()
+    assert p != real, f"tests would write to the live database at {real}"

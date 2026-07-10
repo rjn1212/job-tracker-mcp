@@ -681,23 +681,41 @@ rather than assuming you saw everything.
 
 STEP 2 — Extract postings, one email at a time.
 For each surviving message, call `apple-mail` get_message(message_id=<its id>,
-include_content=true). The body arrives under the "message" key, as PLAIN TEXT,
-not HTML. Extract every job posting it advertises.
+include_content=true). The body arrives under the "message" key as PLAIN TEXT,
+not HTML.
 
-LinkedIn alerts look like this, repeated:
+EVERY ALERT CONTAINS SEVERAL POSTINGS -- typically five. Never stop at the first
+one, and never trust the subject line: Indeed's subject names one job and the
+body holds five. Count what you extracted and say so.
 
-    Director, Software Engineering (1139652)
-    The Judge Group · Chicago, IL
-    $186K-$248K / year          <- optional, its own line
-    Actively recruiting          <- noise; also "Easy Apply", "N company alumni"
+The three boards use three different layouts. Read what is there; do not assume.
 
-So: the TITLE is its own line; the next line is "Company · Location", separated
-by a middle dot; salary and badges are separate lines. Take the location from
-the COMPANY line, not the title. Indeed and Built In differ -- read what is
-there rather than assuming this shape.
+  LinkedIn -- title first, then company and location joined by a middle dot:
+      Director, Software Engineering (1139652)
+      The Judge Group · Chicago, IL
+      $186K-$248K / year            <- optional, own line
+      Actively recruiting           <- noise; also "Easy Apply", "N alumni"
 
-For each posting capture: company, title, location, url (if present), and the
-source (the job board -- infer it from the sender address).
+  Indeed -- title, company, location, salary, each on its own line:
+      Senior Product Manager
+      DocuSign
+      Chicago, IL
+      $140,100 - $206,775 a year    <- optional
+      Degree in Computer Science... <- snippet; noise
+      Just posted                   <- noise; also "1 day ago", "Easily apply"
+
+  Built In -- COMPANY FIRST, then the title. The order is inverted:
+      CVS Health
+      Senior Engineering Manager API Platform
+      In Office | Multiple Locations
+      $118,450-$260,590             <- optional
+
+Built In separates the work-type from the location with an invisible character
+(U+FFFC, often rendered as a box). Treat "In Office", "Remote" and "Hybrid" as
+the work type and the rest as the location. Ignore the box characters.
+
+Location is NEVER part of the title on any of these boards. Take it from the
+company line (LinkedIn), its own line (Indeed), or the work-type line (Built In).
 
 Copy the strings VERBATIM. Do not tidy them. "Acme, Inc." stays "Acme, Inc.";
 "Staff Engineer (Remote) [R-1234]" keeps its decorations; "Remote, US" stays as

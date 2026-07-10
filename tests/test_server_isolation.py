@@ -291,3 +291,27 @@ def test_filter_prompt_distinguishes_reject_from_demote():
     assert "EVERY JOB IS ON-PROFILE" in body      # empty include list is not a trap
     assert "err GENEROUS" in body                 # narrow includes demote good jobs
     assert "include_off_profile=true" in body     # verify after installing
+
+
+def test_importing_server_does_not_open_the_live_database():
+    """server.py runs `db = Database()` at module scope.
+
+    Without JOB_TRACKER_DB pointing elsewhere, `pytest` would open -- and
+    migrate -- the user's real data/jobs.db. It did, once.
+    """
+    from pathlib import Path
+    from job_tracker_mcp import server
+    live = (Path(__file__).resolve().parent.parent / "data" / "jobs.db").resolve()
+    assert server.db.path.resolve() != live
+
+
+def test_triage_prompt_describes_all_three_board_layouts():
+    """Built In inverts the order: company before title. Assume nothing."""
+    from job_tracker_mcp.server import triage_job_alerts
+    body = triage_job_alerts()
+    for board in ("LinkedIn", "Indeed", "Built In"):
+        assert board in body
+    assert "COMPANY FIRST" in body                  # Built In's inversion
+    assert "SEVERAL POSTINGS" in body               # never stop at the first
+    assert "never trust the subject line" in body   # Indeed names one of five
+    assert "Location is NEVER part of the title" in body

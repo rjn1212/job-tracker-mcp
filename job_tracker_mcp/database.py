@@ -36,7 +36,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -222,7 +222,7 @@ class Database:
         """
         steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
                  3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
-                 5: self._migrate_5_to_6}
+                 5: self._rebuild_ids, 6: self._rebuild_ids}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -266,16 +266,13 @@ class Database:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_rules_unique"
             "  ON profile_rules(rule_type, value)")
 
-    def _migrate_5_to_6(self) -> None:
-        """canonicalize_title changed, so every id must be recomputed.
+    def _rebuild_ids(self) -> None:
+        """Recompute every id from the current canonicalizers.
 
-        LinkedIn writes req ids as bare parentheses -- "Director, Software
-        Engineering (1139652)" -- which the old canonicalizer kept, so the same
-        job from an email never deduped against the same job from OneNote.
-
-        This is the id-rebuild the warning in models.py demands. It is idempotent:
-        a row whose id already matches its recomputed id is skipped, so a crash
-        between the DDL and the version bump is harmless.
+        Run whenever canonicalize_company/title/location changes -- the id is a
+        hash of all three, and models.py warns that editing them is a data
+        migration every time. Idempotent: a row whose id already matches is
+        skipped, so a crash between the DDL and the version bump is harmless.
         """
         rows = self.conn.execute(
             "SELECT id, company, title, location FROM jobs").fetchall()
@@ -391,7 +388,7 @@ class Database:
         and available after a deliberate canonicalization change."""
         with self._lock, self.conn:
             before = self.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-            self._migrate_5_to_6()
+            self._rebuild_ids()
             after = self.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         return {"result": "rebuilt", "jobs": after, "lost": before - after}
 

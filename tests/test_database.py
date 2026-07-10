@@ -444,6 +444,14 @@ def test_schema_version_set(db):
     ("Infosys Limited", "infosys"),
     ("Limited", "limited"),        # a company named only a suffix survives
     ("Ag Solutions", "ag solutions"),  # suffixes strip from the tail only
+    # "Group" and "Holdings" are NAME PARTS, not legal suffixes.
+    ("Baker Tilly Advisory Group, LP", "baker tilly advisory group"),
+    ("Howden Group Holdings", "howden group holdings"),
+    ("Venable LLP", "venable"),
+    # A leading "The" is dropped so boards that omit it reach the same row.
+    ("The Judge Group", "judge group"),
+    ("Judge Group", "judge group"),
+    ("The", "the"),
 ])
 def test_canonicalize_company(raw, expected):
     assert canonicalize_company(raw) == expected
@@ -463,6 +471,15 @@ def test_canonicalize_company(raw, expected):
     ("Full-Stack Engineer", "full-stack engineer"),
     ("Front-end Developer", "front-end developer"),
     ("Engineer (Contract)", "engineer (contract)"),
+    # LinkedIn writes req ids in bare parentheses; brackets are not the only shape.
+    ("Director, Software Engineering (1139652)", "director, software engineering"),
+    ("Head of Software Engineering (Health Tech)", "head of software engineering (health tech)"),
+    ("Analyst (3)", "analyst (3)"),
+    # Indeed writes "Sr."; LinkedIn and the notebook write "Senior".
+    ("Sr. Manager, Data Analyst", "senior manager, data analyst"),
+    ("Snr Engineering Manager", "senior engineering manager"),
+    ("Jr. Engineer", "junior engineer"),
+    ("Srivastava Manager", "srivastava manager"),   # whole tokens only
 ])
 def test_canonicalize_title(raw, expected):
     assert canonicalize_title(raw) == expected
@@ -884,3 +901,23 @@ def test_title_keyword_with_decoration_is_refused(db):
 def test_source_pattern_is_not_canonicalized(db):
     """source matches on normalize_key_part exactly; no canonicalizer applies."""
     assert db.add_rejected_pattern("source", "Dice Inc")["result"] == "added"
+
+
+def test_sr_and_senior_are_the_same_job(db):
+    """Indeed says "Sr. Manager"; LinkedIn says "Senior Manager"."""
+    a = add(db, company="Capital One", title="Sr. Manager, Data Analyst")
+    b = add(db, company="Capital One", title="Senior Manager, Data Analyst")
+    assert a["id"] == b["id"] and b["result"] == "duplicate"
+
+
+def test_the_prefix_does_not_split_a_company(db):
+    a = add(db, company="The Judge Group", title="Director")
+    b = add(db, company="Judge Group", title="Director")
+    assert a["id"] == b["id"] and b["result"] == "duplicate"
+
+
+def test_group_is_not_stripped_as_a_legal_suffix(db):
+    """Stripping "Group" would merge Baker Tilly Advisory Group with Baker Tilly Advisory."""
+    a = add(db, company="Baker Tilly Advisory Group", title="Director")
+    b = add(db, company="Baker Tilly Advisory", title="Director")
+    assert a["id"] != b["id"]
