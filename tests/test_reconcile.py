@@ -10,6 +10,7 @@ from job_tracker_mcp.onenote.reconcile import (
     PageRecord,
     extract_table_rows,
     is_anchor_page,
+    extract_applied_date,
     match_pages,
     normalize_date,
     parse_page_title,
@@ -239,46 +240,105 @@ def test_table_extraction_ignores_prose():
     assert extract_table_rows("I applied to Acme on 7/2. It went well.", 2026) == []
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("2026-07-02", "2026-07-02"),
-    ("7/2/2026", "2026-07-02"),
-    ("7/2", "2026-07-02"),
-    ("applied 12/25", "2026-12-25"),
-    ("no date here", None),
-])
-def test_normalize_date(raw, expected):
-    assert normalize_date(raw, 2026) == expected
 
 
 # ------------------------------------------------ page-title extraction
 
 @pytest.mark.parametrize("raw,expected", [
     ("Capital One - Senior Lead Software Engineer, Full Stack",
-     {"company": "Capital One", "title": "Senior Lead Software Engineer, Full Stack"}),
+     {"company": "Capital One", "title": "Senior Lead Software Engineer, Full Stack",
+      "rejected": False}),
     ("Rula - Engineering Manager - Partnerships",
-     {"company": "Rula", "title": "Engineering Manager - Partnerships"}),
-    # A leading status mark the human typed.
+     {"company": "Rula", "title": "Engineering Manager - Partnerships", "rejected": False}),
+    # A leading "x" means Randy was turned down; it is not part of the company name.
     ("x Capital One - Director of Software Engineering",
-     {"company": "Capital One", "title": "Director of Software Engineering"}),
+     {"company": "Capital One", "title": "Director of Software Engineering",
+      "rejected": True}),
     ("*X* Capital One - Senior Manager, Software Engineering, Full Stack",
-     {"company": "Capital One", "title": "Senior Manager, Software Engineering, Full Stack"}),
+     {"company": "Capital One", "title": "Senior Manager, Software Engineering, Full Stack",
+      "rejected": True}),
     # No space after the dash, as typed in the real notebook.
     ("Mitr -Global IT Consulting Org",
-     {"company": "Mitr", "title": "Global IT Consulting Org"}),
+     {"company": "Mitr", "title": "Global IT Consulting Org", "rejected": False}),
     # Company-only pages: guessing a role here would be fabrication.
-    ("Deloitte", {"company": "Deloitte", "title": None}),
-    ("Turnberry Solutions", {"company": "Turnberry Solutions", "title": None}),
+    ("Deloitte", {"company": "Deloitte", "title": None, "rejected": False}),
+    ("Turnberry Solutions",
+     {"company": "Turnberry Solutions", "title": None, "rejected": False}),
     ("Chase Manager of Software Engineering",
-     {"company": "Chase Manager of Software Engineering", "title": None}),
+     {"company": "Chase Manager of Software Engineering", "title": None, "rejected": False}),
     # A hyphen with no surrounding space is part of the name, not a separator.
-    ("Coca-Cola", {"company": "Coca-Cola", "title": None}),
+    ("Coca-Cola", {"company": "Coca-Cola", "title": None, "rejected": False}),
     ("84.51 degrees - VP, Software Engineering",
-     {"company": "84.51 degrees", "title": "VP, Software Engineering"}),
+     {"company": "84.51 degrees", "title": "VP, Software Engineering", "rejected": False}),
     ("2026", None),
     ("", None),
 ])
 def test_parse_page_title(raw, expected):
     assert parse_page_title(raw) == expected
+
+
+def test_rejected_page_proposes_reject_not_applied():
+    """An "x" page means turned down. Proposing mark_applied would be backwards."""
+    jobs = [job("a1", "Capital One", "Director of Software Engineering")]
+    p = PageRecord(page_id="p1", title="x Capital One - Director of Software Engineering",
+                   text="Applied: 06/19/2026", page_order=1)
+    r = match_pages([p], jobs, [])
+    e = r.onenote_only[0]
+    assert e["rejected"] is True
+    assert e["proposed_action"].startswith("reject_job")
+
+
+# ------------------------------------------------------- date extraction
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-07-02", "2026-07-02"),
+    ("7/2/2026", "2026-07-02"),
+    ("06/19/2026", "2026-06-19"),
+    ("07-09-2026", "2026-07-09"),        # Turnberry uses dashes
+    ("15-Jun-2026", "2026-06-15"),       # Zoro's body
+    ("15-June-2026", "2026-06-15"),
+    ("7/2", "2026-07-02"),
+    ("no date here", None),
+    ("99-99-2026", None),
+])
+def test_normalize_date(raw, expected):
+    assert normalize_date(raw, 2026) == expected
+
+
+def test_applied_label_beats_date_label():
+    text = "Date: 01-01-2026\nApplied: 06/19/2026"
+    assert extract_applied_date(text, 2026) == ("2026-06-19", "applied")
+
+
+def test_date_label_used_when_no_applied_label():
+    assert extract_applied_date("Date:07-09-2026", 2026) == ("2026-07-09", "date")
+
+
+def test_candidates_does_not_masquerade_as_a_date_label():
+    """Without \\b, `date\\s*:` matches the tail of "candidates:" and eats garbage."""
+    text = "The ideal candidates: must possess 3 years of 10/10/2020 experience"
+    assert extract_applied_date(text, 2026) == (None, None)
+
+
+def test_no_label_falls_back_to_page_creation_date():
+    jobs = [job("a1", "Zoro", "Sr. Manager, Software Engineering")]
+    p = PageRecord(page_id="p1", title="Zoro - Sr. Manager, Software Engineering",
+                   text="15-Jun-2026\nSr. Manager, Software Engineering",
+                   created_dt="2026-06-16T00:00:00Z", page_order=1)
+    r = match_pages([p], jobs, [])
+    e = r.onenote_only[0]
+    assert e["date_applied"] == "2026-06-16"
+    assert e["date_source"] == "page_created"     # an unlabelled body date is not trusted
+
+
+def test_date_source_is_reported():
+    jobs = [job("a1", "Acme", "Staff Engineer")]
+    p = PageRecord(page_id="p1", title="Acme - Staff Engineer",
+                   text="Applied: 06/19/2026", created_dt="2026-07-01T00:00:00Z",
+                   page_order=1)
+    r = match_pages([p], jobs, [])
+    assert r.onenote_only[0]["date_applied"] == "2026-06-19"
+    assert r.onenote_only[0]["date_source"] == "applied"
 
 
 def test_page_title_match_uses_created_date():

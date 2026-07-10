@@ -20,11 +20,23 @@ from job_tracker_mcp.onenote.htmlio import find_marker
 DEFAULT_MIN_CONFIDENCE = 0.6
 AMBIGUOUS_FLOOR = 0.5
 
-_DATE_PATTERNS = (
-    re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),                       # 2026-07-02
-    re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b"),               # 7/2/2026
-    re.compile(r"\b(\d{1,2})/(\d{1,2})\b"),                       # 7/2
-)
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+_ISO = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")                 # 2026-07-02
+_DMY_NAME = re.compile(r"\b(\d{1,2})-([A-Za-z]{3,9})-(\d{4})\b")  # 15-Jun-2026
+_MDY_SLASH = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")       # 07/02/2026
+_MDY_DASH = re.compile(r"\b(\d{1,2})-(\d{1,2})-(\d{4})\b")        # 07-09-2026
+_MD_ONLY = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")                 # 7/2
+
+# The label hierarchy Randy actually uses: "Applied:" wins, then "Date:".
+#
+# \b matters more than it looks. Without it, `date\s*:` matches the tail of
+# "candidates:" and harvests "s must possess 3 years" as a date. With it, the
+# 'd' in "candidates" has a word character before it and cannot start a match.
+_APPLIED_LABEL = re.compile(r"\bapplied\s*:\s*([^\n]{0,40})", re.I)
+_DATE_LABEL = re.compile(r"\bdate\s*:\s*([^\n]{0,40})", re.I)
 
 _HEADER_WORDS = {"company", "employer", "title", "role", "position", "date",
                  "applied", "status", "link", "url", "notes"}
@@ -83,17 +95,41 @@ def title_similarity(a: str, b: str) -> float:
 # ------------------------------------------------------------- extraction
 
 def normalize_date(raw: str, default_year: int) -> str | None:
-    for pat in _DATE_PATTERNS:
-        m = pat.search(raw)
-        if not m:
-            continue
-        g = m.groups()
-        if len(g) == 1:
-            return g[0]
-        if len(g) == 3:
-            return f"{int(g[2]):04d}-{int(g[0]):02d}-{int(g[1]):02d}"
-        return f"{default_year:04d}-{int(g[0]):02d}-{int(g[1]):02d}"
+    """Every date shape seen in the real notebook, tried most-specific first."""
+    raw = raw or ""
+
+    if m := _ISO.search(raw):                       # 2026-07-02
+        return f"{int(m[1]):04d}-{int(m[2]):02d}-{int(m[3]):02d}"
+
+    if m := _DMY_NAME.search(raw):                  # 15-Jun-2026
+        month = _MONTHS.get(m[2][:3].lower())
+        if month:
+            return f"{int(m[3]):04d}-{month:02d}-{int(m[1]):02d}"
+
+    for pat in (_MDY_SLASH, _MDY_DASH):             # 07/02/2026, 07-09-2026
+        if m := pat.search(raw):
+            month, day = int(m[1]), int(m[2])
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{int(m[3]):04d}-{month:02d}-{day:02d}"
+
+    if m := _MD_ONLY.search(raw):                   # 7/2
+        return f"{default_year:04d}-{int(m[1]):02d}-{int(m[2]):02d}"
+
     return None
+
+
+def extract_applied_date(text: str, default_year: int) -> tuple[str | None, str | None]:
+    """The date the page says you applied, and which label it came from.
+
+    "Applied:" first, then "Date:". Returns (None, None) when neither yields a
+    parseable date -- the caller then falls back to the page's creation date,
+    which is when the note was written, not necessarily when you applied.
+    """
+    for source, pat in (("applied", _APPLIED_LABEL), ("date", _DATE_LABEL)):
+        for m in pat.finditer(text or ""):
+            if parsed := normalize_date(m.group(1), default_year):
+                return parsed, source
+    return None, None
 
 
 # Leading status marks a human puts on a page title: "x ", "X ", "*X* ".
@@ -110,14 +146,24 @@ def is_anchor_page(title: str) -> bool:
 
 
 def parse_page_title(title: str) -> dict | None:
-    """Company and role from a page title like "Capital One - Director, SWE".
+    """Company, role, and rejection status from a page title.
 
-    Returns {"company": str, "title": str | None}. `title` is None when the page
-    is named for a company alone ("Deloitte", "Affirm") -- common enough that
-    guessing a role there would be fabrication. Those pages go to the model,
-    which reads the body and supplies the real role.
+    "Capital One - Director, SWE"    -> role in the title
+    "x Capital One - Director, SWE"  -> the same, and Randy was turned down
+    "Deloitte"                       -> company only; role is None
+
+    `title` is None when the page is named for a company alone. Guessing a role
+    there would be fabrication; those pages go to the model, which reads the
+    body and supplies the real one.
+
+    KNOWN HAZARD: a company whose name genuinely begins with "X " -- X (Twitter),
+    or "X Corp" -- would be read as a rejection marker and lose its first word.
+    No such company appears in this notebook. If one ever does, the title parse
+    must be overridden with a manual link rather than the marker rule relaxed.
     """
-    t = _TITLE_MARK.sub("", title or "").strip()
+    raw = (title or "").strip()
+    rejected = bool(_TITLE_MARK.match(raw))
+    t = _TITLE_MARK.sub("", raw).strip()
     if not t or is_anchor_page(t):
         return None
     parts = _TITLE_SEP.split(t, maxsplit=1)
@@ -125,7 +171,7 @@ def parse_page_title(title: str) -> dict | None:
     role = parts[1].strip(" -–—") if len(parts) > 1 else ""
     if not company:
         return None
-    return {"company": company, "title": role or None}
+    return {"company": company, "title": role or None, "rejected": rejected}
 
 
 def scope_to_subtree(pages: list[PageRecord], root_title: str) -> list[PageRecord]:
@@ -246,8 +292,13 @@ def match_page(page: PageRecord, jobs: list[JobRecord],
     if not records:
         from_title = parse_page_title(page.title)
         if from_title:
-            if page.created_dt:
-                from_title["date_applied"] = page.created_dt[:10]
+            # "Applied:" beats "Date:" beats the page's creation date. The last
+            # is when the note was written, which is only a proxy for when the
+            # application happened -- so say which one was used.
+            found, label = extract_applied_date(page.text, default_year)
+            from_title["date_applied"] = found or (
+                page.created_dt[:10] if page.created_dt else None)
+            from_title["date_source"] = label or "page_created"
             from_title["source"] = "page_title"
             records = [from_title]
     if not records:
@@ -321,18 +372,31 @@ def match_pages(pages: list[PageRecord], jobs: list[JobRecord],
                 parsed_anything = True
                 job = by_id[e["job_id"]]
                 seen_jobs.add(job.id)
+                ex = e.get("extracted") or {}
                 entry = {"page_id": page.page_id, "page_title": page.title,
                          "job_id": job.id, "match_kind": e["match_kind"],
                          "confidence": e["confidence"],
                          "extracted": e.get("extracted"),
                          "db_status": job.status}
-                if job.status == "applied":
+                # A leading "x" on the page title means Randy was turned down.
+                # Proposing mark_applied for those would be exactly backwards.
+                if ex.get("rejected"):
+                    if job.status != "rejected":
+                        rec.onenote_only.append({
+                            **entry, "rejected": True,
+                            "date_applied": e.get("date_applied"),
+                            "proposed_action": f"reject_job(id={job.id!r})",
+                        })
+                    else:
+                        rec.matched.append({**entry, "agrees": True})
+                elif job.status == "applied":
                     rec.matched.append({**entry, "agrees": True})
                 else:
                     date = e.get("date_applied")
                     rec.onenote_only.append({
                         **entry,
                         "date_applied": date,
+                        "date_source": ex.get("date_source"),
                         "proposed_action": (
                             f"mark_applied(id={job.id!r}"
                             + (f", date_applied={date!r})" if date else ")")

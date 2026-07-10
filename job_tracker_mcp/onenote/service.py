@@ -437,6 +437,12 @@ class OneNoteService:
             if e["confidence"] < min_confidence:
                 skipped.append({**e, "reason": "below min_confidence"})
                 continue
+            if e.get("rejected"):
+                # An "x"-prefixed page records a rejection. apply_marks only ever
+                # marks applications; reversing a rejection is never automatic.
+                skipped.append({**e, "reason": "page marks a rejection; "
+                                               "call reject_job explicitly"})
+                continue
             # Reuses Part 1's tool, including its ALLOWED_TRANSITIONS check. Part 2
             # never writes to `jobs` directly and never bypasses the lifecycle.
             res = self.db.mark_applied(
