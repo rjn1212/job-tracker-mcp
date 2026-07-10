@@ -987,5 +987,74 @@ Do not install anything I have not explicitly approved.
 """
 
 
+@mcp.prompt
+def review_new_jobs(batch_size: int = 25, min_salary: int = 0, min_fit: int = 7) -> str:
+    """Score the untriaged jobs and shortlist the best matches.
+
+    Reads ONLY the job-tracker database. No web search, no outside knowledge
+    about companies or postings -- every statement must trace to a stored row.
+    """
+    salary_line = (f"    min_salary   = {min_salary}\n" if min_salary else "")
+    return f"""\
+Help me decide which tracked jobs to apply to.
+
+GROUND RULES. These are not stylistic; violating them makes the output useless.
+
+1. USE ONLY THE `job-tracker` MCP TOOLS. Do not search the web. Do not open a
+   URL. Do not rely on what you remember about a company or a posting. If a fact
+   is not in a row this server returned, you do not know it.
+
+2. NEVER INVENT A URL. Report `url` exactly as stored, or say "no link" when it
+   is null. Oracle and Grainger alerts carry no links at all; that is a fact
+   about the mail, not a gap for you to fill.
+
+3. NEVER INVENT A SALARY. `salary_raw` is what the alert said. `salary_annual_*`
+   is the server's annualization (hourly at 2080 h/yr). A NULL salary means the
+   posting did not state one -- it does not mean zero, and it does not mean low.
+
+4. DO NOT CALL mark_applied. Applying is something I do, and I will tell you.
+   Do not call reject_job or add_rejected_pattern on your own initiative;
+   propose them and let me decide.
+
+STEP 1 — Size the work.
+Call get_stats(). Report total_jobs, by_status, unscored_new, off_profile_new.
+
+STEP 2 — Score one batch.
+Call get_jobs(status="new", limit={batch_size}).
+{salary_line}Unscored jobs sort last, so this returns the unscored backlog first.
+
+For each job, judge fit against MY background and set it with
+    update_job(id, fit_score=N)
+where N is 1-10. Score honestly, not generously: a 7 should mean "I would
+actually send this application." Use only what the row contains -- company,
+title, location, salary, source, times_seen.
+
+`times_seen` is signal. A posting the boards have pushed 14 times is either a
+hard-to-fill role or an agency churning the same listing; say which you think it
+is and why.
+
+STEP 3 — Shortlist.
+Call get_jobs(status="new", min_fit_score={min_fit}) and present them as a table:
+
+  fit | salary | company | title | location | link
+
+Sort by fit, then by salary_annual_max. For every row give me the `url`, or say
+"no link" plainly. Add one sentence per job saying why it scored what it did.
+
+STEP 4 — Tell me what you did NOT like, and why.
+List the jobs you scored 3 or below, grouped by the reason. If a whole company
+or a repeated title keyword is behind several of them, SAY SO and propose:
+    reject_job(id, add_company_pattern=true)
+    add_rejected_pattern("title_keyword", "<word>")
+    add_profile_rule("title_exclude", "<word>")
+Explain the difference: a rejected pattern means I never want to see it again;
+a profile rule merely demotes it out of the default list. Do not install either.
+
+STEP 5 — Report what remains.
+get_stats().unscored_new tells us how many are still unscored. If it is above
+zero, say so and tell me to run this prompt again.
+"""
+
+
 if __name__ == "__main__":
     mcp.run()  # stdio transport

@@ -365,3 +365,22 @@ def test_triage_prompt_pushes_sorting_and_paging_to_the_server():
     assert "OMIT it on the first run" in body     # no watermark yet
     assert "INCLUSIVE" in body                    # overlap free, gaps permanent
     assert "run this prompt again" in body        # resumable, no self-looping
+
+
+def test_review_prompt_confines_claude_to_the_database():
+    """The whole point: no web search, no memory, no invented urls or salaries."""
+    from job_tracker_mcp.server import review_new_jobs
+    body = review_new_jobs()
+    assert "USE ONLY THE `job-tracker` MCP TOOLS" in body
+    assert "Do not search the web" in body
+    assert "NEVER INVENT A URL" in body
+    assert "NEVER INVENT A SALARY" in body
+    assert "does not mean zero" in body          # NULL salary is not a low salary
+    assert "DO NOT CALL mark_applied" in body
+
+
+def test_review_prompt_is_registered():
+    import asyncio
+    from job_tracker_mcp import server
+    names = {p.name for p in asyncio.run(server.mcp.list_prompts())}
+    assert names == {"triage_job_alerts", "setup_job_filters", "review_new_jobs"}
