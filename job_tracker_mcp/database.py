@@ -18,6 +18,7 @@ from pathlib import Path
 
 from job_tracker_mcp.models import (
     ALLOWED_TRANSITIONS,
+    parse_salary,
     JOB_FIELDS,
     PATTERN_TYPES,
     PROFILE_RULE_TYPES,
@@ -36,7 +37,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -69,6 +70,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     date_applied       TEXT,
     status             TEXT NOT NULL DEFAULT 'new',
     fit_score          INTEGER,
+    -- Salary, when the posting states one. Not part of the id: it can change
+    -- between sightings, and a re-sighting must never create a second row.
+    salary_min         INTEGER,
+    salary_max         INTEGER,
+    salary_period      TEXT,          -- 'year' | 'hour'
+    salary_annual_min  INTEGER,       -- hourly normalized at 2080 h/yr, for sorting
+    salary_annual_max  INTEGER,
+    salary_raw         TEXT,          -- exactly as the alert wrote it
     notes              TEXT,
     email_subject      TEXT,
     merged_into        TEXT REFERENCES jobs(id),
@@ -84,7 +93,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     CHECK (times_seen >= 1),
     CHECK (status != 'applied' OR date_applied IS NOT NULL),
     CHECK (length(location_canonical) > 0),
-    CHECK (merged_into IS NULL OR merged_into != id)
+    CHECK (merged_into IS NULL OR merged_into != id),
+    CHECK (salary_period IS NULL OR salary_period IN ('year', 'hour')),
+    CHECK (salary_min IS NULL OR salary_max IS NULL OR salary_min <= salary_max)
 );
 
 CREATE TABLE IF NOT EXISTS rejected_patterns (
@@ -223,7 +234,7 @@ class Database:
         steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
                  3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
                  5: self._rebuild_ids, 6: self._rebuild_ids,
-                 7: self._rebuild_ids}
+                 7: self._rebuild_ids, 8: self._migrate_8_to_9}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -266,6 +277,15 @@ class Database:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_rules_unique"
             "  ON profile_rules(rule_type, value)")
+
+    def _migrate_8_to_9(self) -> None:
+        """Salary columns. Purely additive; no id changes, since salary is not
+        part of the key -- a posting can restate its range between sightings."""
+        for col, typ in (("salary_min", "INTEGER"), ("salary_max", "INTEGER"),
+                         ("salary_period", "TEXT"), ("salary_annual_min", "INTEGER"),
+                         ("salary_annual_max", "INTEGER"), ("salary_raw", "TEXT")):
+            if not self._has_column("jobs", col):
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
 
     def _rebuild_ids(self) -> None:
         """Recompute every id from the current canonicalizers.
@@ -571,6 +591,7 @@ class Database:
         source = entry.get("source")
         notes = entry.get("notes")
         email_subject = entry.get("email_subject")
+        sal = parse_salary(entry.get("salary"))
 
         c_canon = canonicalize_company(company)
         t_canon = canonicalize_title(title)
@@ -588,11 +609,22 @@ class Database:
             # and a backlog import replays them in whatever order you read them.
             first = min(row["date_seen"], seen)
             last = max(row["last_seen"], seen)
+            # Backfill only: a later sighting may carry a url or a salary the
+            # first one lacked, but must never overwrite what is already known.
             cur.execute(
                 "UPDATE jobs SET date_seen = ?, last_seen = ?, "
-                "times_seen = times_seen + 1, url = ?, source = ?, updated_at = ? "
-                "WHERE id = ?",
-                (first, last, row["url"] or url, row["source"] or source, now, row["id"]),
+                "times_seen = times_seen + 1, url = ?, source = ?, "
+                "salary_min = COALESCE(salary_min, ?), "
+                "salary_max = COALESCE(salary_max, ?), "
+                "salary_period = COALESCE(salary_period, ?), "
+                "salary_annual_min = COALESCE(salary_annual_min, ?), "
+                "salary_annual_max = COALESCE(salary_annual_max, ?), "
+                "salary_raw = COALESCE(salary_raw, ?), "
+                "updated_at = ? WHERE id = ?",
+                (first, last, row["url"] or url, row["source"] or source,
+                 sal and sal["min"], sal and sal["max"], sal and sal["period"],
+                 sal and sal["annual_min"], sal and sal["annual_max"],
+                 sal and sal["raw"], now, row["id"]),
             )
             return {
                 "result": "duplicate",
@@ -620,12 +652,16 @@ class Database:
         cur.execute(
             "INSERT INTO jobs (id, company, company_canonical, title, title_canonical, "
             "location, location_canonical, url, source, date_seen, last_seen, "
-            "times_seen, date_applied, status, fit_score, notes, email_subject, "
-            "merged_into, off_profile, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            "times_seen, date_applied, status, fit_score, salary_min, salary_max, "
+            "salary_period, salary_annual_min, salary_annual_max, salary_raw, "
+            "notes, email_subject, merged_into, off_profile, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             (job_id, company, c_canon, title, t_canon, location, l_canon, url, source,
-             seen, seen, status, fit_score, notes, email_subject,
-             1 if off_profile else 0, now, now),
+             seen, seen, status, fit_score,
+             sal and sal["min"], sal and sal["max"], sal and sal["period"],
+             sal and sal["annual_min"], sal and sal["annual_max"], sal and sal["raw"],
+             notes, email_subject, 1 if off_profile else 0, now, now),
         )
         result = {
             "result": "created",
@@ -659,11 +695,12 @@ class Database:
         notes: str | None = None,
         email_subject: str | None = None,
         date_seen: str | None = None,
+        salary: str | None = None,
     ) -> dict:
         entry = dict(
             company=company, title=title, location=location, url=url,
             source=source, fit_score=fit_score, notes=notes,
-            email_subject=email_subject, date_seen=date_seen,
+            email_subject=email_subject, date_seen=date_seen, salary=salary,
         )
         with self._lock, self.conn:
             cur = self.conn.cursor()
@@ -731,6 +768,7 @@ class Database:
         limit: int | None = 50,
         offset: int | None = 0,
         include_off_profile: bool = False,
+        min_salary: int | None = None,
     ) -> dict:
         where, params = [LIVE], []
         if not include_off_profile:
@@ -752,6 +790,11 @@ class Database:
             # An unscored job cannot be said to meet a threshold.
             where.append("fit_score IS NOT NULL AND fit_score >= ?")
             params.append(min_fit_score)
+        if min_salary is not None:
+            # Compare on the annual figure so an hourly posting is comparable.
+            # A job with no stated salary cannot meet a threshold.
+            where.append("salary_annual_max IS NOT NULL AND salary_annual_max >= ?")
+            params.append(int(min_salary))
 
         clause = f"WHERE {' AND '.join(where)}"
         limit = self._clamp(limit, 50)

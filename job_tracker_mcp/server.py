@@ -87,8 +87,16 @@ def add_job(
     notes: str | None = None,
     email_subject: str | None = None,
     date_seen: str | None = None,
+    salary: str | None = None,
 ) -> dict:
     """Add a job posting to the tracker.
+
+    Pass `url` -- the posting's link. Without it the job cannot be investigated.
+    Pass `salary` exactly as the alert wrote it: "$186K-$248K / year",
+    "$140,100 - $206,775 a year", "$97-$100 / hour", "$118,450-$260,590". The
+    server parses the range, the period, and an annualized figure so hourly and
+    salaried postings can be compared. Both are backfilled on a re-sighting, so
+    a later alert that carries them fills in what an earlier one lacked.
 
     Idempotent: adding the same (company, title, location) twice records a
     re-sighting rather than a second row, and never overwrites an existing
@@ -118,7 +126,7 @@ def add_job(
     For a job alert email containing several postings, prefer bulk_add_jobs.
     """
     return db.add_job(company, title, location, url, source, fit_score, notes,
-                      email_subject, date_seen)
+                      email_subject, date_seen, salary)
 
 
 @mcp.tool
@@ -130,7 +138,8 @@ def bulk_add_jobs(jobs: list[dict]) -> dict:
     (company, title, location required). At most 100 per call.
 
     Set `date_seen` on every entry to the alert email's date, not today. One
-    call per email keeps that simple.
+    call per email keeps that simple. Include `url` and `salary` when the email
+    supplies them -- see add_job.
 
     Malformed entries do not abort the batch; each contributes an error to the
     per-entry `results` list, which preserves input order. Returns counts of
@@ -199,6 +208,7 @@ def get_jobs(
     limit: int | None = 50,
     offset: int | None = 0,
     include_off_profile: bool = False,
+    min_salary: int | None = None,
 ) -> dict:
     """List jobs, best fit first, then most recently seen. Unscored jobs sort last.
 
@@ -208,6 +218,9 @@ def get_jobs(
     include_off_profile -- by default, NEW jobs that match no profile rule are
                      hidden. They are stored, not rejected. Pass true to see
                      them, e.g. to check whether a rule is too narrow.
+    min_salary    -- annual floor. Compares salary_annual_max, so an hourly
+                     posting is measured at 2080 h/yr. Jobs with no stated
+                     salary are EXCLUDED: an unknown salary cannot meet a floor.
 
     Applied, rejected and expired jobs are never hidden by profile rules --
     history must not vanish because you later narrowed what you are looking for.
@@ -215,7 +228,8 @@ def get_jobs(
     `total` is the number of jobs matching the filters, ignoring limit/offset.
     If total > offset + len(jobs), there are more pages.
     """
-    return db.get_jobs(status, source, min_fit_score, limit, offset, include_off_profile)
+    return db.get_jobs(status, source, min_fit_score, limit, offset,
+                       include_off_profile, min_salary)
 
 
 @mcp.tool

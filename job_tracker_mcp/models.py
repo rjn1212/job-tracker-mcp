@@ -58,7 +58,9 @@ JOB_FIELDS = (
     "id", "company", "company_canonical", "title", "title_canonical",
     "location", "location_canonical", "url", "source",
     "date_seen", "last_seen", "times_seen", "date_applied",
-    "status", "fit_score", "notes", "email_subject", "merged_into",
+    "status", "fit_score", "salary_min", "salary_max", "salary_period",
+    "salary_annual_min", "salary_annual_max", "salary_raw",
+    "notes", "email_subject", "merged_into",
     "off_profile", "created_at", "updated_at",
 )
 
@@ -328,3 +330,66 @@ def generate_job_id(company: str, title: str, location: str | None) -> str:
         canonicalize_location(location),
     ))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------
+# Salary
+#
+# Three shapes appear in the real alerts, and the units differ:
+#   Indeed    "$140,100 - $206,775 a year"      "$97 - $100 an hour"
+#   LinkedIn  "$186K-$248K / year"              "$97-$100 / hour"
+#   Built In  "$118,450-$260,590"               (period unstated -> assume year)
+#
+# Stored as integers in the annual currency unit plus the raw string, because a
+# range you cannot see the original of is a range you cannot check.
+# --------------------------------------------------------------------------
+
+_MONEY = r"\$?\s*([\d,]+(?:\.\d+)?)\s*([KkMm])?"
+_SALARY_RANGE = re.compile(_MONEY + r"\s*(?:-|–|—|to)\s*" + _MONEY, re.I)
+_SALARY_SINGLE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*([KkMm])?", re.I)
+_PER_HOUR = re.compile(r"\b(?:an?\s+hour|/\s*(?:hour|hr)|per\s+hour|hourly)\b", re.I)
+_PER_YEAR = re.compile(r"\b(?:a\s+year|/\s*(?:year|yr)|per\s+year|annually)\b", re.I)
+
+# A full-time year, for converting an hourly rate into a comparable number.
+HOURS_PER_YEAR = 2080
+
+
+def _money(num: str, suffix: str | None) -> int:
+    v = float(num.replace(",", ""))
+    if suffix and suffix.lower() == "k":
+        v *= 1_000
+    elif suffix and suffix.lower() == "m":
+        v *= 1_000_000
+    return int(round(v))
+
+
+def parse_salary(raw: str | None) -> dict | None:
+    """{'min','max','period','annual_min','annual_max','raw'} or None.
+
+    `min`/`max` are as written; `annual_*` normalizes an hourly rate so two
+    postings can be compared. Returns None rather than guessing when no number
+    is present -- an absent salary and a zero salary are different facts.
+    """
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip()
+
+    period = "hour" if _PER_HOUR.search(s) else "year" if _PER_YEAR.search(s) else None
+
+    if m := _SALARY_RANGE.search(s):
+        lo, hi = _money(m[1], m[2]), _money(m[3], m[4])
+    elif m := _SALARY_SINGLE.search(s):
+        lo = hi = _money(m[1], m[2])
+    else:
+        return None
+    if lo > hi:
+        lo, hi = hi, lo
+
+    # Built In omits the period. A five-figure number is a salary; two or three
+    # digits is an hourly rate. Guessing "year" for $97 would be absurd.
+    if period is None:
+        period = "hour" if hi < 1_000 else "year"
+
+    mult = HOURS_PER_YEAR if period == "hour" else 1
+    return {"min": lo, "max": hi, "period": period,
+            "annual_min": lo * mult, "annual_max": hi * mult, "raw": s}

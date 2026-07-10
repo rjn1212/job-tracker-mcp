@@ -942,3 +942,61 @@ def test_group_is_not_stripped_as_a_legal_suffix(db):
     a = add(db, company="Baker Tilly Advisory Group", title="Director")
     b = add(db, company="Baker Tilly Advisory", title="Director")
     assert a["id"] != b["id"]
+
+
+# ----------------------------------------------------------------- salary
+
+def test_salary_parsed_and_stored(db):
+    r = add(db, salary="$186K-$248K / year")
+    j = db.get_job(r["id"])
+    assert (j["salary_min"], j["salary_max"], j["salary_period"]) == (186000, 248000, "year")
+    assert j["salary_annual_max"] == 248000
+    assert j["salary_raw"] == "$186K-$248K / year"
+
+
+def test_hourly_salary_is_annualized_for_comparison(db):
+    r = add(db, salary="$97-$100 / hour")
+    j = db.get_job(r["id"])
+    assert j["salary_period"] == "hour" and j["salary_min"] == 97
+    assert j["salary_annual_max"] == 100 * 2080
+
+
+def test_salary_without_a_period_is_inferred_by_magnitude(db):
+    """Built In omits the period. $118,450 is a year; $97 would be an hour."""
+    a = add(db, company="A", salary="$118,450-$260,590")
+    b = add(db, company="B", salary="$97-$100")
+    assert db.get_job(a["id"])["salary_period"] == "year"
+    assert db.get_job(b["id"])["salary_period"] == "hour"
+
+
+def test_absent_salary_is_null_not_zero(db):
+    j = db.get_job(add(db)["id"])
+    assert j["salary_min"] is None and j["salary_raw"] is None
+    assert db.get_job(add(db, company="X", salary="Competitive")["id"])["salary_min"] is None
+
+
+def test_salary_and_url_backfill_on_resighting(db):
+    r = add(db)                                            # neither
+    add(db, url="https://x/1", salary="$100,000 - $150,000 a year")
+    j = db.get_job(r["id"])
+    assert j["url"] == "https://x/1" and j["salary_max"] == 150000
+
+
+def test_resighting_never_overwrites_a_known_salary(db):
+    r = add(db, salary="$200,000 a year")
+    add(db, salary="$1 a year")
+    assert db.get_job(r["id"])["salary_min"] == 200000
+
+
+def test_salary_is_not_part_of_the_id(db):
+    a = add(db, salary="$100,000 a year")
+    b = add(db, salary="$999,999 a year")
+    assert a["id"] == b["id"] and b["result"] == "duplicate"
+
+
+def test_min_salary_filter_uses_the_annual_figure(db):
+    add(db, company="Hourly Co", title="X", salary="$100 / hour")     # 208k annual
+    add(db, company="Low Co", title="Y", salary="$120,000 a year")
+    add(db, company="No Salary Co", title="Z")
+    got = {j["company"] for j in db.get_jobs(min_salary=200000)["jobs"]}
+    assert got == {"Hourly Co"}                # no-salary excluded, not defaulted to 0
