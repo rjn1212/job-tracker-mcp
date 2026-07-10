@@ -312,6 +312,16 @@ and a retroactive one could bury a job you already applied to.
 Include lists are dangerous when narrow. `director` demotes `Head of
 Engineering`. Be generous, then audit with `get_jobs(include_off_profile=true)`.
 
+Rules match the **canonical title** — the same string used for deduplication,
+with `(Remote)`, `[R-1234]` and salary ranges stripped, seniority preserved. So
+write them in that form. A rule the canonicalizer would rewrite, like
+`director (remote)`, is **refused** rather than installed dead; the error names
+the form that works. The same guard applies to `company` patterns
+(`Infosys Inc` → use `infosys`) and `title_keyword` patterns.
+
+Profile rules see the **title only** — never the company, location, salary, or
+the email body. Companies belong in a `company` pattern.
+
 #### Negative rules (`rejected_patterns`)
 
 A filter is a row in `rejected_patterns`, of exactly one of three kinds:

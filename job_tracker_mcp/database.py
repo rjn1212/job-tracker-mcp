@@ -376,6 +376,24 @@ class Database:
                             if not rows else
                             f"{off} live job(s) are currently off-profile.")}
 
+    @staticmethod
+    def _unmatchable(value: str, canonicalizer) -> str | None:
+        """A rule that the canonicalizer would rewrite can never match.
+
+        Rules are compared against the CANONICAL company/title, which has already
+        had legal suffixes, "(Remote)", salary ranges and req ids stripped. A rule
+        written as "director (remote)" installs cleanly, reports success, and
+        matches zero jobs forever. Refuse it, and say what to write instead.
+        """
+        canon = canonicalizer(value)
+        if canon != value:
+            return (f"The rule {value!r} can never match: titles and companies are "
+                    f"compared in canonical form, where it becomes {canon!r}. "
+                    f"Decorations like '(Remote)', '[R-1234]', salary ranges and "
+                    f"legal suffixes (Inc, LLC, Corp) are stripped before matching. "
+                    f"Use {canon!r} instead.")
+        return None
+
     def add_profile_rule(self, rule_type: str, value: str,
                          reason: str | None = None) -> dict:
         if rule_type not in PROFILE_RULE_TYPES:
@@ -384,6 +402,8 @@ class Database:
         v = normalize_key_part(value)
         if not v:
             return _err("value must not be empty")
+        if msg := self._unmatchable(v, canonicalize_title):
+            return _err(msg)
 
         with self._lock, self.conn:
             cur = self.conn.execute(
@@ -1120,6 +1140,11 @@ class Database:
         value = normalize_key_part(pattern_value)
         if not value:
             return _err("pattern_value must not be empty")
+        # source is compared with normalize_key_part, so no canonicalizer applies.
+        canonicalizer = {"company": canonicalize_company,
+                         "title_keyword": canonicalize_title}.get(pattern_type)
+        if canonicalizer and (msg := self._unmatchable(value, canonicalizer)):
+            return _err(msg)
 
         with self._lock, self.conn:
             cur = self.conn.execute(

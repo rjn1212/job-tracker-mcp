@@ -839,3 +839,48 @@ def test_recompute_profiles_is_idempotent(db):
     db.add_profile_rule("title_include", "director")
     assert db.recompute_profiles()["reclassified"] == 0     # already correct
     assert db.recompute_profiles()["off_profile_jobs"] == 1
+
+
+# --------------------------------------- rules that could never match are refused
+
+def test_profile_rule_with_stripped_decoration_is_refused(db):
+    """"director (remote)" installs cleanly and matches zero jobs forever.
+
+    Rules are compared against the CANONICAL title, where "(Remote)" is gone.
+    A silently dead rule is exactly the failure this system refuses elsewhere.
+    """
+    out = db.add_profile_rule("title_include", "director (remote)")
+    assert "error" in out
+    assert "can never match" in out["error"]
+    assert "'director'" in out["error"]          # names the form that would work
+    assert db.get_profile_rules()["total"] == 0  # nothing written
+
+
+def test_profile_rule_with_salary_or_req_id_is_refused(db):
+    assert "error" in db.add_profile_rule("title_include", "director - $200k-$250k")
+    assert "error" in db.add_profile_rule("title_include", "director [r-1234]")
+
+
+def test_profile_rule_that_survives_canonicalization_is_accepted(db):
+    for v in ("director of engineering", "staff engineer ii", "senior manager", "junior"):
+        assert db.add_profile_rule("title_include", v)["result"] == "added", v
+
+
+def test_parenthetical_that_is_not_a_decoration_is_allowed(db):
+    """(Contract) is not stripped by canonicalize_title, so the rule can match."""
+    assert db.add_profile_rule("title_exclude", "engineer (contract)")["result"] == "added"
+
+
+def test_company_pattern_with_legal_suffix_is_refused(db):
+    out = db.add_rejected_pattern("company", "Infosys Inc")
+    assert "error" in out and "can never match" in out["error"]
+    assert db.get_rejected_patterns()["total"] == 0
+
+
+def test_title_keyword_with_decoration_is_refused(db):
+    assert "error" in db.add_rejected_pattern("title_keyword", "staffing (remote)")
+
+
+def test_source_pattern_is_not_canonicalized(db):
+    """source matches on normalize_key_part exactly; no canonicalizer applies."""
+    assert db.add_rejected_pattern("source", "Dice Inc")["result"] == "added"

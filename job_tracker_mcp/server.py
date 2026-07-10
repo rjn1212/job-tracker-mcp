@@ -810,6 +810,12 @@ Two kinds, both substring matches against the canonical title:
                  Excludes beat includes: "Junior Director" is off-profile even
                  with include "director".
 
+Both compare against the CANONICAL title -- "(Remote)", "[R-1234]" and salary
+ranges are already stripped; seniority is not. Write rules in that form. A rule
+the canonicalizer would rewrite is REFUSED, not installed dead; the error names
+the form that works. These rules see the TITLE ONLY: not the company, not the
+location, not the email body. Filter companies with a `company` pattern.
+
 A non-matching job is stored as status="new" with off_profile=true. It is hidden
 from get_jobs() but visible with get_jobs(include_off_profile=true), and it is
 counted in get_stats().off_profile_new.
