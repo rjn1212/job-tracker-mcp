@@ -659,37 +659,39 @@ Inclusive is deliberate. Re-reading the boundary email is free, because add_job
 is idempotent and a re-sighting keeps the earliest date_seen. A gap is not free:
 it silently loses a job. When in doubt, overlap.
 {override}
-STEP 1 — Fetch the alerts, then sort and batch them YOURSELF.
+STEP 1 — Fetch this batch. The server sorts and pages for you.
 Call `apple-mail` search_messages with EXACTLY:
-    account = "{account}"
-    mailbox = "{mailbox}"
-    limit   = 1000
+    account   = "{account}"
+    mailbox   = "{mailbox}"
+    sort      = "oldest"
+    limit     = {batch_size}
+    date_from = <last_message_dt from STEP 0, verbatim; OMIT it on the first run>
+
 Both `account` and `mailbox` are mandatory -- that build is restricted to this
-one mailbox and returns "access restricted" for any other. This call returns
-metadata only and is cheap, even for the whole mailbox.
+one mailbox and returns "access restricted" for any other.
 
-search_messages has NO date filter and NO ordering guarantee. It returns
-{{account, mailbox, count, messages[]}}, where each message has:
-    id, subject, sender, date_received, date_sent, read_status, flagged
+sort="oldest" matters. Mail stores messages newest-first, and the server
+reverses BEFORE applying the limit, so you get the oldest `limit` messages, not
+a window into the newest ones. Working newest-first would advance the watermark
+past mail you never read, and nothing goes back for it.
 
-So YOU must:
-  1. Discard the SKIP senders (below).
-  2. Discard anything before the STEP 0 cutoff.
-  3. SORT what remains by date_received, OLDEST FIRST.
-  4. Take the first {batch_size} of them. That is this run's batch.
+date_from is INCLUSIVE, so the watermark message itself comes back again. That
+is intended: re-adding a job is free (add_job is idempotent and a re-sighting
+keeps the earliest date_seen), while a gap loses a job forever.
 
-Oldest first, always. The watermark advances to the newest message you
-processed, so working newest-first would jump the watermark past mail you never
-read, and nothing would ever go back for it.
+The response is {{account, mailbox, sort, offset, count, messages[]}}, and each
+message has: id, subject, sender, date_received, date_sent, read_status, flagged.
 
-If more messages remain after your batch, say so plainly at the end and tell me
-to run this prompt again. Do not try to process hundreds of emails in one pass.
+If `count` equals your `limit`, more mail probably remains. Say so at the end
+and tell me to run this prompt again. Do not loop by yourself.
 
 USE `date_received`, NEVER `date_sent`. date_sent is unset in this mailbox and
 comes back as "0001-01-01T00:00:00Z". date_received looks like
 "2026-07-09T17:33:43-05:00" -- it already carries the local offset, so its first
 ten characters are the local calendar date. Take that YYYY-MM-DD directly; do
 not convert it.
+
+Discard any message from a SKIP sender (below) before you count the batch.
 
 STEP 2 — Extract postings, one email at a time.
 For each surviving message, call `apple-mail` get_message(message_id=<its id>,

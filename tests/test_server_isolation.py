@@ -350,13 +350,17 @@ def test_triage_prompt_covers_the_new_senders():
     assert "times_seen=2" in body              # honest about the Oracle collapse
 
 
-def test_triage_prompt_batches_oldest_first():
-    """search_messages has no ordering guarantee, so a limit=N fetch is not
-    'the oldest N'. Working newest-first would jump the watermark past unread mail."""
+def test_triage_prompt_pushes_sorting_and_paging_to_the_server():
+    """apple-mail-mcp now sorts and filters by date, so Claude must not.
+
+    sort="oldest" reverses BEFORE the limit, so a limited query returns the
+    oldest N. Newest-first would advance the watermark past unread mail.
+    """
     from job_tracker_mcp.server import triage_job_alerts
     body = triage_job_alerts(batch_size=20)
-    assert "OLDEST FIRST" in body
-    assert "limit   = 1000" in body               # fetch all metadata, cheap
-    assert "NO ordering guarantee" in body
-    assert "Take the first 20" in body
-    assert "run this prompt again" in body        # resumable by design
+    assert 'sort      = "oldest"' in body
+    assert "limit     = 20" in body
+    assert "date_from" in body
+    assert "OMIT it on the first run" in body     # no watermark yet
+    assert "INCLUSIVE" in body                    # overlap free, gaps permanent
+    assert "run this prompt again" in body        # resumable, no self-looping
