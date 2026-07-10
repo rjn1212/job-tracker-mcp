@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from job_tracker_mcp.models import canonicalize_company, canonicalize_title
 from job_tracker_mcp.onenote.htmlio import find_marker
@@ -127,6 +128,28 @@ def normalize_date(raw: str, default_year: int) -> str | None:
 _BARE_DATE_LINE = re.compile(
     r"^\s*(\d{4}-\d{2}-\d{2}|\d{1,2}-[A-Za-z]{3,9}-\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*$"
 )
+
+
+def graph_date_to_local(iso: str | None, tz=None) -> str | None:
+    """A Graph UTC instant -> the LOCAL calendar date it fell on.
+
+    Graph stamps createdDateTime in UTC. Slicing iso[:10] off it yields the UTC
+    calendar date, which is a different day from Randy's whenever he writes a
+    page after ~7pm Central: "2026-06-16T02:29:29Z" is 9:29pm on June 15th.
+    Fourteen of his twenty-nine 2026 pages cross that boundary.
+
+    This is Part 1's distinction, restated: dates are local calendar days,
+    timestamps are instants, and one is not a prefix of the other.
+    """
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso[:10] or None          # unparseable: better a date than nothing
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date().isoformat()   # tz=None means the machine's local zone
 
 
 def _first_line_date(text: str, default_year: int) -> str | None:
@@ -319,8 +342,9 @@ def match_page(page: PageRecord, jobs: list[JobRecord],
             # is when the note was written, which is only a proxy for when the
             # application happened -- so say which one was used.
             found, label = extract_applied_date(page.text, default_year)
-            from_title["date_applied"] = found or (
-                page.created_dt[:10] if page.created_dt else None)
+            # NOT created_dt[:10]: that is the UTC calendar date, which is the
+            # previous day for any page written after ~7pm Central.
+            from_title["date_applied"] = found or graph_date_to_local(page.created_dt)
             from_title["date_source"] = label or "page_created"
             from_title["source"] = "page_title"
             records = [from_title]

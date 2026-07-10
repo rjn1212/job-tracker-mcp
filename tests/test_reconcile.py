@@ -1,6 +1,7 @@
 """Pure reconciliation logic. No DB, no HTTP. The important tests."""
 
 import pytest
+from zoneinfo import ZoneInfo
 
 from job_tracker_mcp.models import canonicalize_company, canonicalize_title
 from job_tracker_mcp.onenote.reconcile import (
@@ -11,6 +12,7 @@ from job_tracker_mcp.onenote.reconcile import (
     extract_table_rows,
     is_anchor_page,
     extract_applied_date,
+    graph_date_to_local,
     match_pages,
     normalize_date,
     parse_page_title,
@@ -343,13 +345,16 @@ def test_first_line_must_be_nothing_but_a_date(first_line):
 
 
 def test_no_date_anywhere_falls_back_to_page_creation():
+    """Capital One's page has a req id where a date would be, and no date at all."""
+    created = "2026-07-08T19:58:08.55Z"
     jobs = [job("a1", "Capital One", "Senior Lead Software Engineer")]
     p = PageRecord(page_id="p1", title="Capital One - Senior Lead Software Engineer",
                    text="R243298\nSenior Lead Software Engineer, Full Stack",
-                   created_dt="2026-07-08T00:00:00Z", page_order=1)
+                   created_dt=created, page_order=1)
     r = match_pages([p], jobs, [])
-    assert r.onenote_only[0]["date_applied"] == "2026-07-08"
     assert r.onenote_only[0]["date_source"] == "page_created"
+    # The LOCAL day, whatever zone this machine runs in -- never the naive iso[:10].
+    assert r.onenote_only[0]["date_applied"] == graph_date_to_local(created)
 
 
 def test_date_source_is_reported():
@@ -431,3 +436,34 @@ def test_scope_ignores_pages_without_order():
                                         ("Deloitte", False), (" 2023 ", True)])
 def test_is_anchor_page(t, expected):
     assert is_anchor_page(t) is expected
+
+
+# ------------------------------------------------- UTC vs local calendar date
+
+CHICAGO = ZoneInfo("America/Chicago")
+
+
+@pytest.mark.parametrize("iso,expected", [
+    # Zoro: 02:29 UTC is 21:29 the previous evening in Central.
+    ("2026-06-16T02:29:29.801Z", "2026-06-15"),
+    ("2026-07-05T04:24:10.285Z", "2026-07-04"),
+    # Capital One: 19:58 UTC is 14:58 the same day.
+    ("2026-07-08T19:58:08.55Z", "2026-07-08"),
+    ("2026-01-23T02:32:46.937Z", "2026-01-22"),   # across a CST boundary too
+    ("2026-06-16T00:00:00Z", "2026-06-15"),       # exactly midnight UTC
+])
+def test_graph_date_to_local(iso, expected):
+    assert graph_date_to_local(iso, CHICAGO) == expected
+
+
+def test_graph_date_to_local_handles_none_and_garbage():
+    assert graph_date_to_local(None, CHICAGO) is None
+    assert graph_date_to_local("", CHICAGO) is None
+    # Unparseable: degrade to the leading slice rather than lose the field entirely.
+    assert graph_date_to_local("not-a-date", CHICAGO) == "not-a-date"
+
+
+def test_evening_page_is_dated_the_previous_local_day():
+    """2026-06-16T02:29Z is 9:29pm on June 15 in Central. Zoro's real case."""
+    assert graph_date_to_local("2026-06-16T02:29:29.801Z", CHICAGO) == "2026-06-15"
+    assert "2026-06-16T02:29:29.801Z"[:10] == "2026-06-16"   # what the bug produced
