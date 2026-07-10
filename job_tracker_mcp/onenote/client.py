@@ -110,14 +110,25 @@ class OneNoteClient:
     # ---------------------------------------------------------------- read
 
     def list_pages(self, section_id: str, max_pages: int = 200) -> tuple[list[dict], bool]:
-        """Returns (pages, truncated). $top=100 is the documented maximum."""
+        """Returns (pages, truncated). $top=100 is the documented maximum.
+
+        $orderby=order yields the section's VISUAL sequence, in which a subpage
+        always immediately follows its parent. Graph refuses to project the
+        `level` and `order` properties (on v1.0 and beta alike, despite
+        documenting both), so this ordinal is the only handle on the page
+        hierarchy -- and it is what lets reconciliation scope itself to the
+        pages indented under a given parent.
+        """
         rows, truncated = [], False
-        for p in self.g.get_all(f"/me/onenote/sections/{section_id}/pages",
-                                {"$top": 100, "$select": PAGE_SELECT}):
+        for i, p in enumerate(self.g.get_all(
+                f"/me/onenote/sections/{section_id}/pages",
+                {"$top": 100, "$select": PAGE_SELECT, "$orderby": "order"})):
             if len(rows) >= max_pages:
                 truncated = True
                 break
-            rows.append(_page_row(p))
+            row = _page_row(p)
+            row["page_order"] = i
+            rows.append(row)
         return rows, truncated
 
     def page_content(self, page_id: str) -> tuple[str, str]:

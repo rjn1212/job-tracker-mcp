@@ -33,7 +33,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -175,25 +175,39 @@ class Database:
                     f"(v{SCHEMA_VERSION}). Refusing to open {self.path}."
                 )
 
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
+
     def _migrate(self, frm: int, to: int) -> None:
         """Called from inside _init_schema's lock and transaction. Do not re-enter either.
 
-        NOT ATOMIC, and safe anyway. sqlite3.executescript() issues an implicit
-        COMMIT before it runs, so the new tables land before the user_version
-        bump. A crash in that gap leaves v2 tables with user_version=1 -- and the
-        next open simply re-runs this, because every statement in
-        ONENOTE_SCHEMA_SQL is CREATE ... IF NOT EXISTS.
-
-        Safety here rests on idempotency, not on transactions. A future migration
-        that ALTERs, back-fills, or drops cannot rely on this and must checkpoint
-        differently.
+        NOT ATOMIC. sqlite3.executescript() issues an implicit COMMIT before it
+        runs, so DDL lands before the user_version bump. A crash in that gap
+        leaves the new shape with the old version, and the next open re-runs the
+        step. Safety therefore rests on EVERY STEP BEING IDEMPOTENT, not on
+        transactions -- which is why the v3 step guards its ALTER by hand:
+        `CREATE TABLE IF NOT EXISTS` is re-runnable, `ADD COLUMN` is not.
         """
-        if frm == 1 and to == 2:
-            self.conn.executescript(ONENOTE_SCHEMA_SQL)
-            self.conn.execute("PRAGMA user_version = 2")
-            log.info("migrated database %s from schema v1 to v2", self.path)
-            return
-        raise NotImplementedError(f"No migration path from v{frm} to v{to}")
+        steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3}
+        for version in range(frm, to):
+            step = steps.get(version)
+            if step is None:
+                raise NotImplementedError(f"No migration path from v{version} to v{version + 1}")
+            step()
+            self.conn.execute(f"PRAGMA user_version = {version + 1}")
+            log.info("migrated database %s from schema v%d to v%d",
+                     self.path, version, version + 1)
+
+    def _migrate_1_to_2(self) -> None:
+        self.conn.executescript(ONENOTE_SCHEMA_SQL)     # purely additive tables
+
+    def _migrate_2_to_3(self) -> None:
+        # Graph returns neither `level` nor `order` on pages, so the section's
+        # visual sequence (from $orderby=order) is the only way to recover the
+        # page hierarchy. Persist it.
+        if not self._has_column("onenote_pages", "page_order"):
+            self.conn.execute("ALTER TABLE onenote_pages ADD COLUMN page_order INTEGER")
 
     # ----------------------------------------------------------- validation
 

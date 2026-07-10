@@ -47,6 +47,8 @@ class PageRecord:
     title: str
     text: str
     is_ignored: bool = False
+    created_dt: str | None = None      # Graph UTC; the best available "when I applied"
+    page_order: int | None = None      # position in the section's visual sequence
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,64 @@ def normalize_date(raw: str, default_year: int) -> str | None:
     return None
 
 
+# Leading status marks a human puts on a page title: "x ", "X ", "*X* ".
+_TITLE_MARK = re.compile(r"^\s*(?:\*+\s*[xX]\s*\*+|[xX])\s+")
+# Split only on a dash with whitespace on at least one side, so "Coca-Cola" and
+# "84.51 degrees" survive but "Mitr -Global IT" and "Acme - Manager" split.
+_TITLE_SEP = re.compile(r"\s[-–—]\s*|\s*[-–—]\s")
+_YEAR_PAGE = re.compile(r"^\s*\d{4}\s*$")
+
+
+def is_anchor_page(title: str) -> bool:
+    """A bare year, e.g. "2026". These are the parents of the job pages."""
+    return bool(_YEAR_PAGE.match(title or ""))
+
+
+def parse_page_title(title: str) -> dict | None:
+    """Company and role from a page title like "Capital One - Director, SWE".
+
+    Returns {"company": str, "title": str | None}. `title` is None when the page
+    is named for a company alone ("Deloitte", "Affirm") -- common enough that
+    guessing a role there would be fabrication. Those pages go to the model,
+    which reads the body and supplies the real role.
+    """
+    t = _TITLE_MARK.sub("", title or "").strip()
+    if not t or is_anchor_page(t):
+        return None
+    parts = _TITLE_SEP.split(t, maxsplit=1)
+    company = parts[0].strip(" -–—")
+    role = parts[1].strip(" -–—") if len(parts) > 1 else ""
+    if not company:
+        return None
+    return {"company": company, "title": role or None}
+
+
+def scope_to_subtree(pages: list[PageRecord], root_title: str) -> list[PageRecord]:
+    """The pages indented under `root_title`, using the visual sequence.
+
+    Graph exposes neither `level` nor `order` on pages, so true indentation is
+    unavailable. But subpages always follow their parent in $orderby=order, and
+    the next anchor page (a bare year) ends the subtree. Pages before the root,
+    and the root itself, are excluded.
+
+    An unknown root yields [] rather than everything -- silently reconciling the
+    whole section would be worse than reconciling none of it.
+    """
+    ordered = sorted((p for p in pages if p.page_order is not None),
+                     key=lambda p: p.page_order)
+    root = next((p for p in ordered if (p.title or "").strip() == root_title.strip()), None)
+    if root is None:
+        return []
+    out = []
+    for p in ordered:
+        if p.page_order <= root.page_order:
+            continue
+        if is_anchor_page(p.title):
+            break
+        out.append(p)
+    return out
+
+
 def extract_table_rows(text: str, default_year: int) -> list[dict]:
     """Tier A: structural extraction from a pipe-table, in code.
 
@@ -136,9 +196,19 @@ def extract_table_rows(text: str, default_year: int) -> list[dict]:
 
 # ---------------------------------------------------------------- matching
 
-def _candidates(jobs: list[JobRecord], company: str, title: str):
-    cc, tc = canonicalize_company(company), canonicalize_title(title)
+def _candidates(jobs: list[JobRecord], company: str, title: str | None):
+    cc = canonicalize_company(company)
     same_company = [j for j in jobs if j.company_canonical == cc]
+
+    if title is None:
+        # The page names a company and no role. Matching on company alone is a
+        # guess whenever that company has more than one tracked job, so it is
+        # only allowed to resolve when there is exactly one candidate.
+        if len(same_company) == 1:
+            return "company_only", [(same_company[0], 0.8)]
+        return "company_only", [(j, 0.5) for j in same_company]
+
+    tc = canonicalize_title(title)
     exact = [j for j in same_company if j.title_canonical == tc]
     if exact:
         return "exact", [(exact[0], 1.0)]
@@ -169,19 +239,42 @@ def match_page(page: PageRecord, jobs: list[JobRecord],
         return {"kind": "matched", "job_id": marker, "match_kind": "marker",
                 "confidence": 1.0, "date_applied": None}
 
-    # Tiers 3-5 need something to match ON.
+    # Tiers 3-5 need something to match ON. A running-log table if the page has
+    # one; otherwise the page title itself, which is where this notebook keeps
+    # "Company - Role" and the page's creation date is when the note was made.
     records = extract_table_rows(page.text, default_year)
+    if not records:
+        from_title = parse_page_title(page.title)
+        if from_title:
+            if page.created_dt:
+                from_title["date_applied"] = page.created_dt[:10]
+            from_title["source"] = "page_title"
+            records = [from_title]
     if not records:
         return {"kind": "unparsed", "reason": "no application record found"}
 
     results = []
     for rec in records:
-        kind, scored = _candidates(jobs, rec["company"], rec["title"])
+        kind, scored = _candidates(jobs, rec["company"], rec.get("title"))
         if kind == "exact":
             job, conf = scored[0]
             results.append({"kind": "matched", "job_id": job.id, "match_kind": "exact",
                             "confidence": 1.0, "extracted": rec,
                             "date_applied": rec.get("date_applied")})
+            continue
+
+        if kind == "company_only":
+            if len(scored) == 1:
+                job, conf = scored[0]
+                results.append({"kind": "matched", "job_id": job.id, "match_kind": "fuzzy",
+                                "confidence": conf, "extracted": rec,
+                                "date_applied": rec.get("date_applied")})
+            elif scored:
+                results.append({"kind": "ambiguous", "extracted": rec,
+                                "candidates": [{"job_id": j.id, "title": j.title,
+                                                "confidence": s} for j, s in scored]})
+            else:
+                results.append({"kind": "unmatched", "extracted": rec})
             continue
 
         strong = [(j, s) for j, s in scored if s >= min_confidence]

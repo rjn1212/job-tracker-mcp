@@ -110,6 +110,52 @@ def test_auth_status_never_hits_network(unconfigured):
     unconfigured.auth_status()          # the _no_network fixture would explode
 
 
+def test_persisted_client_id_is_used_when_env_is_unset(unconfigured, monkeypatch):
+    """onenote-auth.sh saves the client id, so the server needs no env var.
+
+    The id is a public identifier, not a secret. Requiring it in two unrelated
+    places -- a shell export and Claude Desktop's env block -- is how setup fails.
+    """
+    from job_tracker_mcp.onenote import auth
+    from job_tracker_mcp.onenote.service import OneNoteService
+
+    monkeypatch.delenv("JOB_TRACKER_MS_CLIENT_ID", raising=False)
+    unconfigured.store.set_state(auth.CLIENT_ID_KEY, "saved-guid")
+
+    svc = OneNoteService(unconfigured.db)      # re-read state on construction
+    assert svc.auth_status()["configured"] is True
+    assert auth.client_id() == "saved-guid"
+
+
+def test_env_client_id_wins_over_persisted(unconfigured, monkeypatch):
+    from job_tracker_mcp.onenote import auth
+    from job_tracker_mcp.onenote.service import OneNoteService
+
+    unconfigured.store.set_state(auth.CLIENT_ID_KEY, "saved-guid")
+    monkeypatch.setenv("JOB_TRACKER_MS_CLIENT_ID", "env-guid")
+    OneNoteService(unconfigured.db)
+    assert auth.client_id() == "env-guid"
+
+
+def test_client_id_fallback_does_not_leak_between_databases(unconfigured, tmp_path,
+                                                            monkeypatch):
+    """A stale module-level id must not follow a service onto another database."""
+    from job_tracker_mcp.database import Database
+    from job_tracker_mcp.onenote import auth
+    from job_tracker_mcp.onenote.service import OneNoteService
+
+    monkeypatch.delenv("JOB_TRACKER_MS_CLIENT_ID", raising=False)
+    unconfigured.store.set_state(auth.CLIENT_ID_KEY, "saved-guid")
+    OneNoteService(unconfigured.db)
+    assert auth.client_id() == "saved-guid"
+
+    other = Database(db_path=tmp_path / "other.db")
+    try:
+        assert OneNoteService(other).auth_status()["configured"] is False
+    finally:
+        other.close()
+
+
 def test_onenote_tools_unconfigured_return_errors_not_exceptions(unconfigured):
     from job_tracker_mcp.onenote.auth import AuthError
     with pytest.raises(AuthError):      # server.py's _onenote_guard turns this into {"error"}

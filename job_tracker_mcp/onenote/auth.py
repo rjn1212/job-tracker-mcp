@@ -37,6 +37,18 @@ FALLBACK_FILE = FALLBACK_DIR / "msal_cache.json"
 KEYCHAIN_TIMEOUT_S = 5.0
 
 ACCOUNT_KEY = "home_account_id"
+CLIENT_ID_KEY = "client_id"
+
+# Set by OneNoteService from onenote_state when the env var is absent. The client
+# id is NOT a secret -- it is a public identifier, safe in the database -- so
+# persisting it at sign-in spares the user from having to set the same value in
+# two unrelated places (their shell, and Claude Desktop's env block).
+_CLIENT_ID_FALLBACK: str | None = None
+
+
+def set_client_id_fallback(value: str | None) -> None:
+    global _CLIENT_ID_FALLBACK
+    _CLIENT_ID_FALLBACK = (value or "").strip() or None
 
 
 class AuthError(Exception):
@@ -59,13 +71,16 @@ def not_authenticated(reason: str = "not_authenticated") -> AuthError:
 
 
 def client_id() -> str:
-    cid = os.environ.get("JOB_TRACKER_MS_CLIENT_ID", "").strip()
+    """Env var, else whatever onenote-auth.sh persisted at sign-in."""
+    cid = os.environ.get("JOB_TRACKER_MS_CLIENT_ID", "").strip() or _CLIENT_ID_FALLBACK
     if not cid:
         raise AuthError(
-            "JOB_TRACKER_MS_CLIENT_ID is not set. Register an app at "
+            "No Microsoft app client id is configured. Register an app at "
             "https://entra.microsoft.com (public client, delegated Notes.ReadWrite, "
-            "allow public client flows), then set it in the Claude Desktop config "
-            "`env` block -- Claude Desktop does not read your shell profile.",
+            "'allow public client flows' = Yes, audience 'any org directory and "
+            f"personal Microsoft accounts'), then run:\n"
+            f"    {auth_command()} <client-id>\n"
+            "That signs you in and remembers the id, so nothing else needs setting.",
             reason="not_configured",
         )
     return cid
@@ -133,13 +148,27 @@ def build_app(cache=None) -> msal.PublicClientApplication:
     )
 
 
-def _select_account(app, home_account_id: str | None):
-    """get_accounts() may return several (personal + work).
+def cached_accounts(cache) -> list[dict]:
+    """Read accounts straight out of the serialized cache. NEVER touches the network.
+
+    msal.PublicClientApplication performs authority discovery in its constructor
+    -- even with instance_discovery=False -- so merely building an app to ask
+    "who is signed in?" issues an HTTPS call to login.microsoftonline.com. A
+    diagnostic tool that needs the internet to report that you are offline is
+    useless, and inside a stdio server it is a stall nobody can see.
+    """
+    kind = msal.TokenCache.CredentialType.ACCOUNT
+    if hasattr(cache, "search"):          # msal >= 1.29; find() is deprecated
+        return list(cache.search(kind))
+    return cache.find(kind)
+
+
+def _select_account(accounts: list[dict], home_account_id: str | None):
+    """A cache may hold several accounts (personal + work).
 
     Silently taking accounts[0] is how this tool ends up reading the wrong
     notebook, so the chosen account is persisted at sign-in and selected by id.
     """
-    accounts = app.get_accounts()
     if not accounts:
         return None
     if home_account_id:
@@ -156,8 +185,13 @@ def _select_account(app, home_account_id: str | None):
 def acquire_token_silent(home_account_id: str | None = None) -> str:
     """Never triggers interactive auth. MSAL handles refresh internally."""
     cache = load_cache()
+    # Check the cache before building an app: an unauthenticated caller should
+    # get the "run onenote-auth.sh" message, not a network timeout.
+    if not cached_accounts(cache):
+        raise not_authenticated()
+
     app = build_app(cache)
-    account = _select_account(app, home_account_id)
+    account = _select_account(app.get_accounts(), home_account_id)
     if account is None:
         raise not_authenticated()
     result = app.acquire_token_silent(SCOPES, account=account)
@@ -168,9 +202,8 @@ def acquire_token_silent(home_account_id: str | None = None) -> str:
 
 
 def account_info(home_account_id: str | None = None) -> dict | None:
-    cache = load_cache()
-    app = build_app(cache)
-    acct = _select_account(app, home_account_id)
+    """Offline. Used by onenote_auth_status, which must never hit the network."""
+    acct = _select_account(cached_accounts(load_cache()), home_account_id)
     if not acct:
         return None
     return {"username": acct.get("username"),
@@ -182,7 +215,16 @@ def account_info(home_account_id: str | None = None) -> dict | None:
 # This block is the ONLY place in the project permitted to call print(): it is a
 # terminal program, not the MCP server. Nothing at module scope may print.
 
-def _device_code_flow() -> int:
+def _device_code_flow(cid_arg: str | None = None) -> int:
+    # Accept the client id as an argument: this runs in a terminal, where the
+    # Claude Desktop `env` block is irrelevant and an export is easy to forget.
+    from job_tracker_mcp.database import Database
+    from job_tracker_mcp.onenote.store import OneNoteStore
+
+    db = Database()
+    store = OneNoteStore(db)
+    set_client_id_fallback(cid_arg or store.get_state(CLIENT_ID_KEY))
+
     cache = load_cache()
     app = build_app(cache)
 
@@ -205,18 +247,16 @@ def _device_code_flow() -> int:
     save_cache(cache)
     accounts = app.get_accounts()
     acct = accounts[0] if accounts else {}
-    home_id = acct.get("home_account_id", "")
 
-    # Persist the chosen account so the server never guesses between
-    # a personal and a work sign-in.
+    # Persist the chosen account so the server never guesses between a personal
+    # and a work sign-in, and the client id so nothing else needs configuring.
     try:
-        from job_tracker_mcp.database import Database
-        from job_tracker_mcp.onenote.store import OneNoteStore
-        db = Database()
-        OneNoteStore(db).set_state(ACCOUNT_KEY, home_id)
-        db.close()
+        store.set_state(ACCOUNT_KEY, acct.get("home_account_id", ""))
+        store.set_state(CLIENT_ID_KEY, client_id())
     except Exception as exc:  # noqa: BLE001
         print(f"\n  WARNING: signed in, but could not record the account: {exc}")
+    finally:
+        db.close()
 
     print(f"\n  Signed in as {acct.get('username', 'unknown')}")
     print("  Token cached. You can close this terminal.\n")
@@ -225,8 +265,9 @@ def _device_code_flow() -> int:
 
 if __name__ == "__main__":
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+    arg = sys.argv[1].strip() if len(sys.argv) > 1 else None
     try:
-        raise SystemExit(_device_code_flow())
+        raise SystemExit(_device_code_flow(arg))
     except AuthError as exc:
         print(f"\n  {exc}\n", file=sys.stderr)
         raise SystemExit(2) from None

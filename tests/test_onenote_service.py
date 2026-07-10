@@ -50,6 +50,9 @@ def gpage(pid, modified="2026-07-01T00:00:00Z", title="Log"):
 @pytest.fixture
 def svc(db, monkeypatch):
     monkeypatch.setenv("JOB_TRACKER_MS_CLIENT_ID", "fake-guid")
+    # Empty root page == reconcile the whole section. The subtree scoping is
+    # exercised separately, in test_reconcile.py and test_scoping below.
+    monkeypatch.setenv("JOB_TRACKER_ONENOTE_ROOT_PAGE", "")
     return lambda handler, **kw: OneNoteService(db, graph_for(handler, **kw))
 
 
@@ -272,3 +275,43 @@ def test_unlink_refused_for_tool_created_pages(db, svc, monkeypatch):
     svc(handler).create_page("T", ["b"], job_id=jid, confirm=True)
     out = svc(handler).link_page("np", jid, unlink=True)
     assert "Cannot unlink" in out["error"]
+
+
+# --------------------------------------------------------- subtree scoping
+
+def test_reconcile_scopes_to_root_page(db, svc, monkeypatch):
+    """Only the pages indented under the root page are applications.
+
+    The section also holds interview prep and previous years' applications.
+    """
+    monkeypatch.setenv("JOB_TRACKER_ONENOTE_ROOT_PAGE", "2026")
+    db.add_job(company="Acme Corp", title="Staff Engineer", location="Remote")
+    pages = [gpage("prep", title="Interview Questions"),
+             gpage("y25", title="2025"),
+             gpage("old", title="Acme Corp - Staff Engineer"),   # 2025's child
+             gpage("y26", title="2026"),
+             gpage("new", title="Acme Corp - Staff Engineer")]   # 2026's child
+    s = svc(resolving_handler(pages, content="<p>notes</p>"))
+    s.sync()
+    out = s.reconcile()
+    assert out["scope"] == {"root_page": "2026", "pages_in_scope": 1}
+    assert [e["page_id"] for e in out["onenote_only"]] == ["new"]
+
+
+def test_reconcile_unknown_root_page_scopes_to_nothing(db, svc, monkeypatch):
+    """Silently reconciling the whole section would be worse than reconciling none."""
+    monkeypatch.setenv("JOB_TRACKER_ONENOTE_ROOT_PAGE", "2099")
+    db.add_job(company="Acme Corp", title="Staff Engineer", location="Remote")
+    s = svc(resolving_handler([gpage("p1", title="Acme Corp - Staff Engineer")]))
+    s.sync()
+    out = s.reconcile()
+    assert out["scope"]["pages_in_scope"] == 0
+    assert out["onenote_only"] == []
+
+
+def test_page_order_is_persisted(db, svc):
+    s = svc(resolving_handler([gpage("a"), gpage("b"), gpage("c")]))
+    s.sync()
+    orders = {r["page_id"]: r["page_order"]
+              for r in db.conn.execute("SELECT page_id, page_order FROM onenote_pages")}
+    assert orders == {"a": 0, "b": 1, "c": 2}

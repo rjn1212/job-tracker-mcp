@@ -24,21 +24,21 @@ def make_v1_db(path):
     conn.close()
 
 
-def test_fresh_db_is_v2(db):
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 2
+def test_fresh_db_is_current(db):
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 3
     names = {r[0] for r in db.conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"jobs", "rejected_patterns", "onenote_pages",
             "onenote_links", "onenote_state"} <= names
 
 
-def test_migration_v1_to_v2(tmp_path):
+def test_migration_v1_to_current(tmp_path):
     p = tmp_path / "v1.db"
     make_v1_db(p)
     before = sqlite3.connect(str(p)).execute("SELECT * FROM jobs").fetchone()
 
     d = Database(db_path=p)
-    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == 3
     after = d.conn.execute("SELECT * FROM jobs").fetchone()
     assert tuple(after) == tuple(before)          # the job survived byte-identical
     names = {r[0] for r in d.conn.execute(
@@ -61,15 +61,30 @@ def test_migration_is_idempotent(tmp_path):
     conn.close()
 
     d = Database(db_path=p)                        # must not raise
-    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert d.conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert d.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    assert d._has_column("onenote_pages", "page_order")
     d.close()
 
 
-def test_v3_database_refuses(tmp_path):
-    p = tmp_path / "v3.db"
+def test_migration_v2_to_v3_add_column_is_guarded(tmp_path):
+    """ALTER TABLE ADD COLUMN is NOT idempotent -- unlike the v1->v2 CREATEs.
+
+    Re-running the step after a crash between the DDL and the version bump must
+    not raise "duplicate column name".
+    """
+    p = tmp_path / "v1.db"
+    make_v1_db(p)
     d = Database(db_path=p)
-    d.conn.execute("PRAGMA user_version = 3")
+    d._migrate_2_to_3()                            # run the step a second time
+    assert d._has_column("onenote_pages", "page_order")
+    d.close()
+
+
+def test_future_database_refuses(tmp_path):
+    p = tmp_path / "v9.db"
+    d = Database(db_path=p)
+    d.conn.execute("PRAGMA user_version = 99")
     d.conn.commit()
     d.close()
     with pytest.raises(RuntimeError, match="newer than this code"):

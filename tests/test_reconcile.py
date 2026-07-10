@@ -9,8 +9,11 @@ from job_tracker_mcp.onenote.reconcile import (
     LinkRecord,
     PageRecord,
     extract_table_rows,
+    is_anchor_page,
     match_pages,
     normalize_date,
+    parse_page_title,
+    scope_to_subtree,
 )
 
 
@@ -191,10 +194,18 @@ def test_ignored_pages_excluded():
 
 
 def test_unparsed_page_gets_actionable_next_step():
-    r = match_pages([page("Resume drafts and interview prep", title="Resume drafts")],
+    """A page whose title yields no company at all -- e.g. an anchor page."""
+    r = match_pages([page("nothing structured here", title="2026")],
                     [job("a1", "Acme", "Staff Engineer")], [])
     assert len(r.unparsed_pages) == 1
     assert "onenote_get_page" in r.unparsed_pages[0]["proposed_action"]
+
+
+def test_untracked_company_page_is_unmatched_not_silent():
+    r = match_pages([page("free prose", title="Resume drafts")],
+                    [job("a1", "Acme", "Staff Engineer")], [])
+    assert len(r.unmatched) == 1
+    assert r.unmatched[0]["extracted"]["company"] == "Resume drafts"
 
 
 def test_merged_jobs_are_not_candidates():
@@ -237,3 +248,105 @@ def test_table_extraction_ignores_prose():
 ])
 def test_normalize_date(raw, expected):
     assert normalize_date(raw, 2026) == expected
+
+
+# ------------------------------------------------ page-title extraction
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Capital One - Senior Lead Software Engineer, Full Stack",
+     {"company": "Capital One", "title": "Senior Lead Software Engineer, Full Stack"}),
+    ("Rula - Engineering Manager - Partnerships",
+     {"company": "Rula", "title": "Engineering Manager - Partnerships"}),
+    # A leading status mark the human typed.
+    ("x Capital One - Director of Software Engineering",
+     {"company": "Capital One", "title": "Director of Software Engineering"}),
+    ("*X* Capital One - Senior Manager, Software Engineering, Full Stack",
+     {"company": "Capital One", "title": "Senior Manager, Software Engineering, Full Stack"}),
+    # No space after the dash, as typed in the real notebook.
+    ("Mitr -Global IT Consulting Org",
+     {"company": "Mitr", "title": "Global IT Consulting Org"}),
+    # Company-only pages: guessing a role here would be fabrication.
+    ("Deloitte", {"company": "Deloitte", "title": None}),
+    ("Turnberry Solutions", {"company": "Turnberry Solutions", "title": None}),
+    ("Chase Manager of Software Engineering",
+     {"company": "Chase Manager of Software Engineering", "title": None}),
+    # A hyphen with no surrounding space is part of the name, not a separator.
+    ("Coca-Cola", {"company": "Coca-Cola", "title": None}),
+    ("84.51 degrees - VP, Software Engineering",
+     {"company": "84.51 degrees", "title": "VP, Software Engineering"}),
+    ("2026", None),
+    ("", None),
+])
+def test_parse_page_title(raw, expected):
+    assert parse_page_title(raw) == expected
+
+
+def test_page_title_match_uses_created_date():
+    jobs = [job("a1", "Capital One", "Senior Lead Software Engineer, Full Stack")]
+    p = PageRecord(page_id="p1", title="Capital One - Senior Lead Software Engineer, Full Stack",
+                   text="", created_dt="2026-07-08T13:04:00Z", page_order=1)
+    r = match_pages([p], jobs, [])
+    assert r.onenote_only[0]["match_kind"] == "exact"
+    assert r.onenote_only[0]["date_applied"] == "2026-07-08"
+
+
+def test_company_only_page_resolves_when_unambiguous():
+    jobs = [job("a1", "Deloitte", "Engineering Manager")]
+    p = PageRecord(page_id="p1", title="Deloitte", text="",
+                   created_dt="2026-06-19T00:00:00Z", page_order=1)
+    r = match_pages([p], jobs, [])
+    assert r.onenote_only[0]["job_id"] == "a1"
+
+
+def test_company_only_page_is_ambiguous_when_several_jobs():
+    """Never guess which of two Deloitte roles a bare "Deloitte" page means."""
+    jobs = [job("a1", "Deloitte", "Engineering Manager"),
+            job("b2", "Deloitte", "Director of Data")]
+    p = PageRecord(page_id="p1", title="Deloitte", text="", page_order=1)
+    r = match_pages([p], jobs, [])
+    assert not r.onenote_only
+    assert {c["job_id"] for c in r.ambiguous[0]["candidates"]} == {"a1", "b2"}
+
+
+# ------------------------------------------------------- subtree scoping
+
+def _p(pid, title, order):
+    return PageRecord(page_id=pid, title=title, text="", page_order=order)
+
+
+REAL_SHAPE = [
+    _p("prep", "Interview Questions", 0),
+    _p("y23", "2023", 1),
+    _p("dtn", "DTN", 2),
+    _p("y25", "2025", 3),
+    _p("old1", "Capital One - Director", 4),
+    _p("y26", "2026", 5),
+    _p("new1", "Zoro", 6),
+    _p("new2", "Deloitte", 7),
+]
+
+
+def test_scope_to_subtree_takes_children_only():
+    got = [p.page_id for p in scope_to_subtree(REAL_SHAPE, "2026")]
+    assert got == ["new1", "new2"]
+
+
+def test_scope_stops_at_the_next_anchor():
+    got = [p.page_id for p in scope_to_subtree(REAL_SHAPE, "2023")]
+    assert got == ["dtn"]                       # stops at 2025, excludes 2023 itself
+
+
+def test_scope_unknown_root_yields_nothing_not_everything():
+    """Silently reconciling the whole section would be worse than reconciling none."""
+    assert scope_to_subtree(REAL_SHAPE, "2099") == []
+
+
+def test_scope_ignores_pages_without_order():
+    pages = [*REAL_SHAPE, PageRecord(page_id="x", title="Stray", text="")]
+    assert "x" not in [p.page_id for p in scope_to_subtree(pages, "2026")]
+
+
+@pytest.mark.parametrize("t,expected", [("2026", True), ("2025 - Jun", False),
+                                        ("Deloitte", False), (" 2023 ", True)])
+def test_is_anchor_page(t, expected):
+    assert is_anchor_page(t) is expected

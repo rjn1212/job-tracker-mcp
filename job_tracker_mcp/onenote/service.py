@@ -23,6 +23,7 @@ from job_tracker_mcp.onenote.reconcile import (
     LinkRecord,
     PageRecord,
     match_pages,
+    scope_to_subtree,
 )
 from job_tracker_mcp.onenote.store import OneNoteStore
 
@@ -52,6 +53,15 @@ def write_enabled() -> bool:
     return _env("JOB_TRACKER_ONENOTE_WRITE", "0") == "1"
 
 
+def root_page() -> str:
+    """The parent page whose subpages are applications, e.g. "2026".
+
+    Empty means "the whole section". The section also holds interview prep,
+    resume drafts, and previous years, none of which are applications.
+    """
+    return _env("JOB_TRACKER_ONENOTE_ROOT_PAGE", "2026")
+
+
 def _err(msg: str) -> dict:
     return {"error": msg}
 
@@ -61,6 +71,10 @@ class OneNoteService:
         self.db = db
         self.store = OneNoteStore(db)
         self._graph = graph            # injected in tests; built lazily otherwise
+        # The env var still wins, but onenote-auth.sh persists the client id so the
+        # server works without one. Set unconditionally, so constructing a service
+        # against a different database cannot inherit a stale id.
+        auth.set_client_id_fallback(self.store.get_state(auth.CLIENT_ID_KEY))
 
     # ------------------------------------------------------------- plumbing
 
@@ -362,7 +376,17 @@ class OneNoteService:
             row = self.store.get_page_row(p["page_id"])
             pages.append(PageRecord(page_id=p["page_id"], title=p["title"],
                                     text=row["content_text"] or "",
-                                    is_ignored=bool(row["is_ignored"])))
+                                    is_ignored=bool(row["is_ignored"]),
+                                    created_dt=row["created_dt"],
+                                    page_order=row["page_order"]))
+
+        root = root_page()
+        if root:
+            scoped = scope_to_subtree(pages, root)
+            if not scoped:
+                log.warning("root page %r not found; reconciling nothing", root)
+            pages = scoped
+
         links = [LinkRecord(page_id=l["page_id"], job_id=l["job_id"],
                             match_kind=l["match_kind"], confidence=l["confidence"],
                             date_applied=l["date_applied"])
@@ -376,6 +400,8 @@ class OneNoteService:
         jobs, pages, links = self._records()
         rec = match_pages(pages, jobs, links, min_confidence,
                           default_year=date.today().year)
+        scope_note = (f" Scoped to the {len(pages)} page(s) under {root_page()!r}."
+                      if root_page() else "")
 
         # Persist the derived links so the extraction cost is paid once per page.
         # ON CONFLICT DO NOTHING: a manual link is never overwritten.
@@ -398,10 +424,11 @@ class OneNoteService:
 
         if dry_run or not apply_marks:
             n = len(rec.onenote_only)
+            out["scope"] = {"root_page": root_page(), "pages_in_scope": len(pages)}
             out["message"] = (
-                f"{n} job(s) appear applied in OneNote but not in the database. "
-                f"Re-run with dry_run=false, apply_marks=true to update."
-                if n else "No discrepancies to apply."
+                (f"{n} job(s) appear applied in OneNote but not in the database. "
+                 f"Re-run with dry_run=false, apply_marks=true to update."
+                 if n else "No discrepancies to apply.") + scope_note
             )
             return out
 

@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS onenote_pages (
     page_id           TEXT PRIMARY KEY,
     section_id        TEXT NOT NULL,
     title             TEXT NOT NULL,
+    -- Position in the section's visual sequence, from $orderby=order. Graph does
+    -- NOT return `level` or `order` on v1.0 or beta (despite documenting both),
+    -- so indentation cannot be read directly. But subpages always follow their
+    -- parent in this sequence, which is enough to scope a subtree.
+    page_order        INTEGER,
     created_dt        TEXT NOT NULL,
     last_modified_dt  TEXT NOT NULL,
     content_html      TEXT,
@@ -64,7 +69,7 @@ CREATE TABLE IF NOT EXISTS onenote_state (
 LIVE_PAGE = "deleted_at IS NULL"
 
 PAGE_FIELDS = (
-    "page_id", "section_id", "title", "created_dt", "last_modified_dt",
+    "page_id", "section_id", "title", "page_order", "created_dt", "last_modified_dt",
     "web_url", "client_url", "is_ignored", "first_seen_at", "last_seen_at",
     "deleted_at",
 )
@@ -163,12 +168,14 @@ class OneNoteStore:
                 synced = p["last_modified_dt"] if pid in contents else None
 
                 self.conn.execute(
-                    "INSERT INTO onenote_pages (page_id, section_id, title, created_dt, "
-                    "last_modified_dt, content_html, content_text, content_synced_dt, "
-                    "web_url, client_url, is_ignored, first_seen_at, last_seen_at, deleted_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL) "
+                    "INSERT INTO onenote_pages (page_id, section_id, title, page_order, "
+                    "created_dt, last_modified_dt, content_html, content_text, "
+                    "content_synced_dt, web_url, client_url, is_ignored, first_seen_at, "
+                    "last_seen_at, deleted_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL) "
                     "ON CONFLICT(page_id) DO UPDATE SET "
                     "  title = excluded.title, "
+                    "  page_order = excluded.page_order, "
                     "  last_modified_dt = excluded.last_modified_dt, "
                     "  web_url = COALESCE(excluded.web_url, onenote_pages.web_url), "
                     "  client_url = COALESCE(excluded.client_url, onenote_pages.client_url), "
@@ -179,8 +186,9 @@ class OneNoteStore:
                     "  content_text = COALESCE(excluded.content_text, onenote_pages.content_text), "
                     "  content_synced_dt = COALESCE(excluded.content_synced_dt, "
                     "                               onenote_pages.content_synced_dt)",
-                    (pid, section_id, p["title"], p["created_dt"], p["last_modified_dt"],
-                     html, text, synced, p.get("web_url"), p.get("client_url"), now, now),
+                    (pid, section_id, p["title"], p.get("page_order"), p["created_dt"],
+                     p["last_modified_dt"], html, text, synced, p.get("web_url"),
+                     p.get("client_url"), now, now),
                 )
 
             for pid, row in existing.items():
@@ -208,12 +216,12 @@ class OneNoteStore:
         with self._lock, self.conn:
             self.conn.execute(
                 "INSERT OR REPLACE INTO onenote_pages (page_id, section_id, title, "
-                "created_dt, last_modified_dt, content_html, content_text, "
+                "page_order, created_dt, last_modified_dt, content_html, content_text, "
                 "content_synced_dt, web_url, client_url, is_ignored, first_seen_at, "
                 "last_seen_at, deleted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)",
-                (page["page_id"], section_id, page["title"], page["created_dt"],
-                 page["last_modified_dt"], page.get("content_html"),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)",
+                (page["page_id"], section_id, page["title"], page.get("page_order"),
+                 page["created_dt"], page["last_modified_dt"], page.get("content_html"),
                  page.get("content_text"), page["last_modified_dt"],
                  page.get("web_url"), page.get("client_url"), now, now),
             )
