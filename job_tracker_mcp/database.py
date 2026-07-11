@@ -38,7 +38,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- and written back. NULL until fetched; the alert email never carries it.
     description        TEXT,
     description_fetched_at TEXT,       -- local ISO; when the JD was cached
+    -- Stamped when an agent updates fit_score on a job that has a description:
+    -- i.e. the score now reflects the actual posting, not just the title. Lets
+    -- a review resume, and separates JD-scored jobs from title-only ones.
+    jd_reviewed_at     TEXT,
     notes              TEXT,
     email_subject      TEXT,
     merged_into        TEXT REFERENCES jobs(id),
@@ -240,7 +244,7 @@ class Database:
                  3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
                  5: self._rebuild_ids, 6: self._rebuild_ids,
                  7: self._rebuild_ids, 8: self._migrate_8_to_9,
-                 9: self._migrate_9_to_10}
+                 9: self._migrate_9_to_10, 10: self._migrate_10_to_11}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -299,6 +303,10 @@ class Database:
             name = col.split()[0]
             if not self._has_column("jobs", name):
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
+
+    def _migrate_10_to_11(self) -> None:
+        if not self._has_column("jobs", "jd_reviewed_at"):
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN jd_reviewed_at TEXT")
 
     def _rebuild_ids(self) -> None:
         """Recompute every id from the current canonicalizers.
@@ -1201,7 +1209,8 @@ class Database:
             return {"result": "error", "id": id, "message": msg}
 
         row = cur.execute(
-            "SELECT id, status, date_applied, merged_into FROM jobs WHERE id = ?", (id,)
+            "SELECT id, status, date_applied, merged_into, description "
+            "FROM jobs WHERE id = ?", (id,)
         ).fetchone()
         if row is None:
             return {"result": "error", "id": id, "message": f"No job with id {id}"}
@@ -1244,6 +1253,15 @@ class Database:
         if "date_applied" in patch:
             sets.append("date_applied = ?"); params.append(patch["date_applied"])
             changed.append("date_applied")
+
+        # Scoring a job that has its description IS the JD review. Stamp it, so
+        # the review is resumable and JD-scored jobs are distinguishable from
+        # title-only ones. A score change without a description (e.g. the initial
+        # bootstrap) does not count.
+        if "fit_score" in patch and row["description"] and \
+                not row["description"].startswith("[posting expired"):
+            sets.append("jd_reviewed_at = ?"); params.append(now_str())
+            changed.append("jd_reviewed_at")
 
         sets.append("updated_at = ?"); params.append(now_str())
         params.append(id)
@@ -1297,6 +1315,40 @@ class Database:
             "errors": sum(r["result"] == "error" for r in results),
             "results": results,
         }
+
+    def jobs_to_review(self, within_days: int = 14, limit: int = 25) -> dict:
+        """Jobs with a real description that have NOT yet been JD-scored.
+
+        The reviewer's worklist: call this, read each description, set a fresh
+        fit_score with update_job. Updating the score auto-stamps jd_reviewed_at,
+        so the job drops off this list and the review resumes cleanly next call.
+        """
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=max(0, int(within_days)))).isoformat()
+        limit = self._clamp(limit, 25)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT {JOB_COLUMNS} FROM jobs WHERE {LIVE} AND status = 'new' "
+                f"AND description IS NOT NULL AND description NOT LIKE '[posting expired%' "
+                f"AND jd_reviewed_at IS NULL AND date_seen >= ? "
+                f"ORDER BY fit_score DESC, date_seen DESC LIMIT ?",
+                (cutoff, limit)
+            ).fetchall()
+            total = self.conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE {LIVE} AND status='new' "
+                f"AND description IS NOT NULL AND description NOT LIKE '[posting expired%' "
+                f"AND jd_reviewed_at IS NULL AND date_seen >= ?", (cutoff,)
+            ).fetchone()[0]
+            reviewed = self.conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE jd_reviewed_at IS NOT NULL "
+                "AND merged_into IS NULL"
+            ).fetchone()[0]
+        return {"jobs": [row_to_job(r) for r in rows], "returned": len(rows),
+                "total_unreviewed": total, "already_reviewed": reviewed,
+                "message": (f"{total} described job(s) still need a JD-informed score; "
+                            f"{reviewed} already reviewed. Read each description and set "
+                            f"fit_score with update_job -- that marks it reviewed. Re-run "
+                            f"for the next slice.")}
 
     # ----------------------------------------------------- job descriptions
 

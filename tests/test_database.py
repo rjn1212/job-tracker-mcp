@@ -1098,3 +1098,32 @@ def test_needing_description_interleaves_sites(db):
     hosts = [re.search(r"//([^/]+)", j["url"]).group(1) for j in db.jobs_needing_description()["jobs"]]
     # no two consecutive from the same host
     assert all(hosts[i] != hosts[i+1] for i in range(len(hosts)-1)), hosts
+
+
+# ------------------------------------------------ jd review tracking (v11)
+
+def test_scoring_a_described_job_marks_it_reviewed(db):
+    r = add(db)
+    db.update_job(r["id"], fit_score=6)                 # title-only, no desc
+    assert db.get_job(r["id"])["jd_reviewed_at"] is None
+    db.set_job_description(r["id"], "a genuine job description of some length")
+    assert db.jobs_to_review()["total_unreviewed"] == 1
+    db.update_job(r["id"], fit_score=8)                 # scored WITH a desc
+    assert db.get_job(r["id"])["jd_reviewed_at"] is not None
+    assert db.jobs_to_review()["total_unreviewed"] == 0
+
+
+def test_review_worklist_excludes_expired_and_undescribed(db):
+    a = add(db, company="Desc")["id"]; db.set_job_description(a, "real description text here")
+    b = add(db, company="NoDesc")["id"]
+    c = add(db, company="Expired")["id"]; db.set_job_description(c, "[posting expired / removed]")
+    for j in (a, b, c): db.update_job(j, fit_score=1) or db.update_job(j, fit_score=7)
+    ids = {j["id"] for j in db.jobs_to_review()["jobs"]}
+    # only the described, non-expired one; and 'a' was just scored-with-desc so it's reviewed
+    assert b not in ids and c not in ids
+
+
+def test_bulk_update_also_stamps_review(db):
+    a = add(db, company="A")["id"]; db.set_job_description(a, "description of the role here")
+    db.bulk_update_jobs([{"id": a, "fit_score": 9}])
+    assert db.get_job(a)["jd_reviewed_at"] is not None

@@ -664,6 +664,22 @@ def jobs_needing_description(within_days: int = 14, min_fit: int = 7,
 
 @mcp.tool
 @_tool_guard
+def jobs_to_review(within_days: int = 14, limit: int = 25) -> dict:
+    """The JD-review worklist: described jobs not yet re-scored from their JD.
+
+    Returns jobs (fit-ranked) that have a real description but whose fit_score
+    still reflects only the title. Read each `description`, decide a fresh score,
+    and set it with update_job(id, fit_score=N) -- that AUTOMATICALLY marks the
+    job reviewed (stamps jd_reviewed_at) and drops it from this list, so a review
+    resumes cleanly and you never re-score the same job.
+
+    `already_reviewed` and `total_unreviewed` in the response track progress.
+    """
+    return db.jobs_to_review(within_days, limit)
+
+
+@mcp.tool
+@_tool_guard
 def set_job_description(id: str, text: str) -> dict:
     """Cache the full posting text fetched from a job's url.
 
