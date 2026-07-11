@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from datetime import date, datetime
@@ -37,7 +38,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -78,6 +79,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     salary_annual_min  INTEGER,       -- hourly normalized at 2080 h/yr, for sorting
     salary_annual_max  INTEGER,
     salary_raw         TEXT,          -- exactly as the alert wrote it
+    -- The full posting text, fetched lazily from `url` by the reviewing agent
+    -- and written back. NULL until fetched; the alert email never carries it.
+    description        TEXT,
+    description_fetched_at TEXT,       -- local ISO; when the JD was cached
     notes              TEXT,
     email_subject      TEXT,
     merged_into        TEXT REFERENCES jobs(id),
@@ -234,7 +239,8 @@ class Database:
         steps = {1: self._migrate_1_to_2, 2: self._migrate_2_to_3,
                  3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
                  5: self._rebuild_ids, 6: self._rebuild_ids,
-                 7: self._rebuild_ids, 8: self._migrate_8_to_9}
+                 7: self._rebuild_ids, 8: self._migrate_8_to_9,
+                 9: self._migrate_9_to_10}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -286,6 +292,13 @@ class Database:
                          ("salary_annual_max", "INTEGER"), ("salary_raw", "TEXT")):
             if not self._has_column("jobs", col):
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+
+    def _migrate_9_to_10(self) -> None:
+        """Job-description cache columns. Purely additive; not part of the key."""
+        for col in ("description TEXT", "description_fetched_at TEXT"):
+            name = col.split()[0]
+            if not self._has_column("jobs", name):
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
 
     def _rebuild_ids(self) -> None:
         """Recompute every id from the current canonicalizers.
@@ -1161,6 +1174,82 @@ class Database:
         return {"result": "rejected", "id": id, "patterns_added": added,
                 "patterns_existing": existing, "message": " ".join(parts)}
 
+    # Fields a caller may patch through update_job / bulk_update_jobs. Company,
+    # title and location are excluded on purpose: they are the natural key, and
+    # changing one silently orphans the row's id.
+    _PATCHABLE = ("fit_score", "notes", "url", "status", "date_applied",
+                  "salary", "description")
+
+    def _update_one(self, cur, id: str, patch: dict) -> dict:
+        """Apply a partial patch to one job. Assumes an open transaction.
+
+        Only the keys present in `patch` are written; everything else is left
+        untouched. Unknown keys are an error, so a typo does not silently no-op.
+        """
+        unknown = [k for k in patch if k not in self._PATCHABLE]
+        if unknown:
+            return {"result": "error", "id": id,
+                    "message": f"Cannot patch {unknown}; allowed: {', '.join(self._PATCHABLE)}"}
+        if not patch:
+            return {"result": "error", "id": id, "message": "No fields to update"}
+        if "fit_score" in patch and (msg := self._bad_fit_score(patch["fit_score"])):
+            return {"result": "error", "id": id, "message": msg}
+        if "status" in patch and (msg := self._bad_status(patch["status"])):
+            return {"result": "error", "id": id, "message": msg}
+        if "date_applied" in patch and patch["date_applied"] is not None \
+                and (msg := self._bad_date(patch["date_applied"])):
+            return {"result": "error", "id": id, "message": msg}
+
+        row = cur.execute(
+            "SELECT id, status, date_applied, merged_into FROM jobs WHERE id = ?", (id,)
+        ).fetchone()
+        if row is None:
+            return {"result": "error", "id": id, "message": f"No job with id {id}"}
+        if row["merged_into"]:
+            return {"result": "error", "id": id, "message": self._merged_err(row)}
+
+        sets, params, changed = [], [], []
+        for col in ("fit_score", "notes", "url"):
+            if col in patch:
+                sets.append(f"{col} = ?"); params.append(patch[col]); changed.append(col)
+
+        if "salary" in patch:
+            sal = parse_salary(patch["salary"])
+            for col, val in (("salary_min", sal and sal["min"]),
+                             ("salary_max", sal and sal["max"]),
+                             ("salary_period", sal and sal["period"]),
+                             ("salary_annual_min", sal and sal["annual_min"]),
+                             ("salary_annual_max", sal and sal["annual_max"]),
+                             ("salary_raw", sal and sal["raw"])):
+                sets.append(f"{col} = ?"); params.append(val)
+            changed.append("salary")
+
+        if "description" in patch:
+            sets.append("description = ?"); params.append(patch["description"])
+            sets.append("description_fetched_at = ?"); params.append(now_str())
+            changed.append("description")
+
+        new_status = row["status"]
+        if "status" in patch:
+            s = patch["status"]
+            if s not in ALLOWED_TRANSITIONS[row["status"]]:
+                return {"result": "error", "id": id,
+                        "message": f"Invalid status transition: {row['status']} -> {s}"}
+            sets.append("status = ?"); params.append(s); changed.append("status")
+            new_status = s
+            if s == "applied" and row["date_applied"] is None and "date_applied" not in patch:
+                sets.append("date_applied = ?"); params.append(today_str())
+                changed.append("date_applied")
+
+        if "date_applied" in patch:
+            sets.append("date_applied = ?"); params.append(patch["date_applied"])
+            changed.append("date_applied")
+
+        sets.append("updated_at = ?"); params.append(now_str())
+        params.append(id)
+        cur.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", params)
+        return {"result": "updated", "id": id, "changed": changed, "status": new_status}
+
     def update_job(
         self,
         id: str,
@@ -1168,47 +1257,119 @@ class Database:
         notes: str | None = None,
         url: str | None = None,
         status: str | None = None,
+        salary: str | None = None,
+        date_applied: str | None = None,
+        description: str | None = None,
     ) -> dict:
-        if fit_score is None and notes is None and url is None and status is None:
-            return _err("No fields to update")
-        if msg := self._bad_fit_score(fit_score):
-            return _err(msg)
-        if status is not None and (msg := self._bad_status(status)):
-            return _err(msg)
-
+        patch = {k: v for k, v in dict(
+            fit_score=fit_score, notes=notes, url=url, status=status,
+            salary=salary, date_applied=date_applied, description=description,
+        ).items() if v is not None}
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT id, status, date_applied, merged_into FROM jobs WHERE id = ?", (id,)
-            ).fetchone()
+            out = self._update_one(self.conn, id, patch)
+        return _err(out["message"]) if out["result"] == "error" else out
+
+    def bulk_update_jobs(self, updates: list[dict]) -> dict:
+        """Patch many jobs in ONE call. Each update is {id, ...fields}.
+
+        Exists because Desktop rescoring 84 jobs one update_job at a time is 84
+        round-trips, which trips its client-side timeout. A malformed item drops
+        to an error in `results` without aborting the rest.
+        """
+        if not isinstance(updates, list):
+            return _err("updates must be a list of {id, ...fields} objects")
+        if not updates:
+            return _err("updates must not be empty")
+        if len(updates) > MAX_BULK:
+            return _err(f"Too many updates ({len(updates)}); send at most {MAX_BULK}")
+
+        results = []
+        with self._lock, self.conn:
+            cur = self.conn.cursor()
+            for u in updates:
+                if not isinstance(u, dict) or "id" not in u:
+                    results.append({"result": "error", "message": f"missing id: {u!r}"})
+                    continue
+                patch = {k: v for k, v in u.items() if k != "id"}
+                results.append(self._update_one(cur, u["id"], patch))
+        return {
+            "updated": sum(r["result"] == "updated" for r in results),
+            "errors": sum(r["result"] == "error" for r in results),
+            "results": results,
+        }
+
+    # ----------------------------------------------------- job descriptions
+
+    def set_job_description(self, id: str, text: str) -> dict:
+        """Cache the full posting text an agent fetched from the job's url.
+
+        Written once and read offline thereafter -- the alert email never
+        carries the description, and re-fetching a live posting is what this
+        cache exists to avoid.
+        """
+        if not text or not text.strip():
+            return _err("text must not be empty")
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT merged_into FROM jobs WHERE id = ?", (id,)).fetchone()
             if row is None:
                 return _err(f"No job with id {id}")
             if row["merged_into"]:
-                return _err(self._merged_err(row))
+                return _err(self._merged_err(dict(id=id, merged_into=row["merged_into"])))
+            self.conn.execute(
+                "UPDATE jobs SET description = ?, description_fetched_at = ?, updated_at = ? "
+                "WHERE id = ?", (text, now_str(), now_str(), id))
+        return {"result": "stored", "id": id, "chars": len(text)}
 
-            sets, params, changed = [], [], []
-            if fit_score is not None:
-                sets.append("fit_score = ?"); params.append(fit_score); changed.append("fit_score")
-            if notes is not None:
-                sets.append("notes = ?"); params.append(notes); changed.append("notes")
-            if url is not None:
-                sets.append("url = ?"); params.append(url); changed.append("url")
+    def jobs_needing_description(self, within_days: int = 14, min_fit: int = 7,
+                                limit: int = 25) -> dict:
+        """The fetch worklist: recent, promising, fetchable, not-yet-cached jobs.
 
-            new_status = row["status"]
-            if status is not None:
-                if status not in ALLOWED_TRANSITIONS[row["status"]]:
-                    return _err(f"Invalid status transition: {row['status']} -> {status}")
-                sets.append("status = ?"); params.append(status); changed.append("status")
-                new_status = status
-                # Satisfies the "applied implies a date" CHECK constraint.
-                if status == "applied" and row["date_applied"] is None:
-                    sets.append("date_applied = ?"); params.append(today_str())
-                    changed.append("date_applied")
+        Bounded to the last `within_days` because a posting older than that is
+        likely expired and is kept only for dedup. Ordered ROUND-ROBIN across
+        job boards so an agent fetching the list never hits the same host twice
+        in a row -- the throttle is baked into the order, no sleeping required.
+        """
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=max(0, int(within_days)))).isoformat()
+        limit = self._clamp(limit, 25)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT id, company, title, location, source, url, fit_score, date_seen, "
+                f"salary_raw FROM jobs WHERE {LIVE} AND status = 'new' "
+                f"AND description IS NULL AND url IS NOT NULL "
+                f"AND date_seen >= ? AND (fit_score IS NULL OR fit_score >= ?) "
+                f"ORDER BY fit_score DESC, date_seen DESC",
+                (cutoff, int(min_fit))
+            ).fetchall()
 
-            sets.append("updated_at = ?"); params.append(now_str())
-            params.append(id)
-            self.conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", params)
+        # Round-robin by host, so consecutive items target different sites.
+        def host(u):
+            m = re.search(r"https?://([^/]+)", u or "")
+            return (m.group(1) if m else "").replace("www.", "")
+        from collections import defaultdict, deque
+        queues = defaultdict(deque)
+        for r in rows:
+            queues[host(r["url"])].append(dict(r))
+        interleaved, qs = [], list(queues.values())
+        while qs and len(interleaved) < limit:
+            for q in qs:
+                if q:
+                    interleaved.append(q.popleft())
+                    if len(interleaved) >= limit:
+                        break
+            qs = [q for q in qs if q]
 
-        return {"result": "updated", "id": id, "changed": changed, "status": new_status}
+        total = self.conn.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE {LIVE} AND status='new' "
+            f"AND description IS NULL AND url IS NOT NULL AND date_seen >= ? "
+            f"AND (fit_score IS NULL OR fit_score >= ?)", (cutoff, int(min_fit))
+        ).fetchone()[0]
+        return {"jobs": interleaved, "returned": len(interleaved),
+                "total_needing": total, "within_days": within_days,
+                "cutoff": cutoff,
+                "message": (f"{total} job(s) within {within_days} days need a description; "
+                            f"returning {len(interleaved)} interleaved by site. Fetch each "
+                            f"url, then set_job_description(id, text). Re-run for more.")}
 
     # ------------------------------------------------------ pattern tooling
 

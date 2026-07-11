@@ -60,6 +60,7 @@ JOB_FIELDS = (
     "date_seen", "last_seen", "times_seen", "date_applied",
     "status", "fit_score", "salary_min", "salary_max", "salary_period",
     "salary_annual_min", "salary_annual_max", "salary_raw",
+    "description", "description_fetched_at",
     "notes", "email_subject", "merged_into",
     "off_profile", "created_at", "updated_at",
 )

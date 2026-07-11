@@ -247,8 +247,18 @@ def update_job(
     notes: str | None = None,
     url: str | None = None,
     status: str | None = None,
+    salary: str | None = None,
+    date_applied: str | None = None,
+    description: str | None = None,
 ) -> dict:
-    """Update a job's fit_score, notes, url, or status. Only supplied fields change.
+    """Patch one job. Only the fields you pass change; the rest are untouched.
+
+    Patchable: fit_score, notes, url, status, salary (parsed like add_job),
+    date_applied (ISO), description. Company, title and location are NOT
+    patchable -- they form the id, and changing one would orphan the row.
+
+    To change many jobs at once, use bulk_update_jobs -- it is one call instead
+    of one per job, which is what prevents the client-side timeout.
 
     `notes` REPLACES existing notes entirely (this is the correction tool).
     Contrast mark_applied, whose `notes` APPENDS.
@@ -261,7 +271,7 @@ def update_job(
     it; the next add_job for that company would auto-reject again. Use
     remove_rejected_pattern for that.
     """
-    return db.update_job(id, fit_score, notes, url, status)
+    return db.update_job(id, fit_score, notes, url, status, salary, date_applied, description)
 
 
 @mcp.tool
@@ -618,6 +628,50 @@ def reconcile_applications(dry_run: bool = True, min_confidence: float = 0.6,
     Status transitions are still enforced: a rejected job lands in `skipped`.
     """
     return _onenote().reconcile(dry_run, min_confidence, apply_marks, limit)
+
+
+@mcp.tool
+@_tool_guard
+def bulk_update_jobs(updates: list[dict]) -> dict:
+    """Patch many jobs in ONE call. Each item is {id, ...fields to change}.
+
+    Use this instead of many update_job calls -- e.g. after scoring a batch,
+    send [{"id": "...", "fit_score": 8}, ...] as a single call. One round-trip
+    for the whole batch; separate update_job calls per job can time out.
+
+    Same patchable fields as update_job. A bad item lands in `results` as an
+    error without aborting the others.
+    """
+    return db.bulk_update_jobs(updates)
+
+
+@mcp.tool
+@_tool_guard
+def jobs_needing_description(within_days: int = 14, min_fit: int = 7,
+                            limit: int = 25) -> dict:
+    """The worklist of jobs whose full description should be fetched.
+
+    Returns recent (within `within_days`), promising (fit >= `min_fit`),
+    fetchable (has a url), not-yet-cached NEW jobs -- ordered ROUND-ROBIN across
+    job boards so consecutive items hit different sites. Fetch each `url`, then
+    call set_job_description(id, text). Re-run for the next slice.
+
+    Older jobs are omitted on purpose: a posting past two weeks is usually
+    expired and is kept only for deduplication.
+    """
+    return db.jobs_needing_description(within_days, min_fit, limit)
+
+
+@mcp.tool
+@_tool_guard
+def set_job_description(id: str, text: str) -> dict:
+    """Cache the full posting text fetched from a job's url.
+
+    Written once, read offline forever after. This is what turns "score a
+    title" into "score a job": after storing, re-score with
+    update_job(id, fit_score=N) against the real requirements.
+    """
+    return db.set_job_description(id, text)
 
 
 # ---------------------------------------------------------------------------

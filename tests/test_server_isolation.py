@@ -49,7 +49,7 @@ def test_import_without_client_id(tmp_path):
     r = _fresh_import({"JOB_TRACKER_DB": str(tmp_path / "t.db")}, IMPORT_AND_COUNT)
     assert r.returncode == 0, r.stderr
     assert r.stdout == ""
-    assert "TOOLS=31" in r.stderr
+    assert "TOOLS=34" in r.stderr
 
 
 def test_database_constructor_imports_no_network_stack(tmp_path):

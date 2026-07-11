@@ -1000,3 +1000,101 @@ def test_min_salary_filter_uses_the_annual_figure(db):
     add(db, company="No Salary Co", title="Z")
     got = {j["company"] for j in db.get_jobs(min_salary=200000)["jobs"]}
     assert got == {"Hourly Co"}                # no-salary excluded, not defaulted to 0
+
+
+# --------------------------------------------- partial patch + bulk update
+
+def test_update_job_patches_only_supplied_fields(db):
+    r = add(db, notes="keep me")
+    db.update_job(r["id"], fit_score=8)
+    j = db.get_job(r["id"])
+    assert j["fit_score"] == 8 and j["notes"] == "keep me"   # notes untouched
+
+
+def test_update_job_can_patch_salary_and_description(db):
+    r = add(db)
+    out = db.update_job(r["id"], salary="$200K-$250K / year", description="full JD")
+    assert set(out["changed"]) == {"salary", "description"}
+    j = db.get_job(r["id"])
+    assert j["salary_max"] == 250000 and j["description"] == "full JD"
+    assert j["description_fetched_at"] is not None
+
+
+def test_update_job_rejects_key_fields(db):
+    """company/title/location are the id; patching them would orphan the row."""
+    r = add(db)
+    assert "error" in db.update_job(r["id"], notes=None)          # nothing to do
+    # the underlying _update_one refuses unknown keys
+    out = db._update_one(db.conn, r["id"], {"company": "X"})
+    assert out["result"] == "error" and "Cannot patch" in out["message"]
+
+
+def test_bulk_update_jobs_one_call_many_jobs(db):
+    a = add(db, company="A")["id"]
+    b = add(db, company="B")["id"]
+    out = db.bulk_update_jobs([
+        {"id": a, "fit_score": 9},
+        {"id": b, "fit_score": 4, "status": "rejected"},
+        {"id": "nope", "fit_score": 5},              # missing job
+        {"fit_score": 5},                            # missing id
+    ])
+    assert out["updated"] == 2 and out["errors"] == 2
+    assert db.get_job(a)["fit_score"] == 9
+    assert db.get_job(b)["status"] == "rejected"
+
+
+def test_bulk_update_validates_each_item(db):
+    a = add(db)["id"]
+    out = db.bulk_update_jobs([{"id": a, "fit_score": 99}])   # out of range
+    assert out["errors"] == 1 and out["updated"] == 0
+    assert db.get_job(a)["fit_score"] is None                 # nothing written
+
+
+# -------------------------------------------------- description worklist
+
+def test_set_and_read_job_description(db):
+    r = add(db)
+    assert db.set_job_description(r["id"], "a long job description")["chars"] == 22
+    j = db.get_job(r["id"])
+    assert j["description"] == "a long job description"
+    assert j["description_fetched_at"] is not None
+
+
+def test_set_description_rejects_empty(db):
+    r = add(db)
+    assert "error" in db.set_job_description(r["id"], "   ")
+
+
+def test_needing_description_respects_the_two_week_cutoff(db):
+    from job_tracker_mcp.database import today_str
+    from datetime import date, timedelta
+    old = (date.today() - timedelta(days=30)).isoformat()
+    recent = today_str()
+    a = add(db, company="Old", url="https://linkedin.com/1", date_seen=old)["id"]
+    b = add(db, company="New", url="https://linkedin.com/2", date_seen=recent)["id"]
+    db.update_job(a, fit_score=9); db.update_job(b, fit_score=9)
+    ids = [j["id"] for j in db.jobs_needing_description()["jobs"]]
+    assert b in ids and a not in ids                 # 30-day-old job excluded
+
+
+def test_needing_description_excludes_low_fit_and_no_url_and_cached(db):
+    from job_tracker_mcp.database import today_str
+    t = today_str()
+    lo = add(db, company="LowFit", url="https://x/1", date_seen=t)["id"]; db.update_job(lo, fit_score=3)
+    nou = add(db, company="NoUrl", date_seen=t)["id"]; db.update_job(nou, fit_score=9)
+    done = add(db, company="Cached", url="https://x/3", date_seen=t)["id"]; db.update_job(done, fit_score=9)
+    db.set_job_description(done, "already have it")
+    ids = [j["id"] for j in db.jobs_needing_description()["jobs"]]
+    assert lo not in ids and nou not in ids and done not in ids
+
+
+def test_needing_description_interleaves_sites(db):
+    from job_tracker_mcp.database import today_str
+    import re
+    t = today_str()
+    for i, host in enumerate(["linkedin.com","linkedin.com","indeed.com","indeed.com"]):
+        j = add(db, company=f"C{i}", url=f"https://{host}/{i}", date_seen=t)["id"]
+        db.update_job(j, fit_score=8)
+    hosts = [re.search(r"//([^/]+)", j["url"]).group(1) for j in db.jobs_needing_description()["jobs"]]
+    # no two consecutive from the same host
+    assert all(hosts[i] != hosts[i+1] for i in range(len(hosts)-1)), hosts
