@@ -111,17 +111,26 @@ def score(company: str, title: str, location: str, annual_max: int | None) -> in
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rescore", action="store_true",
+                    help="Overwrite EXISTING scores too. Off by default: this rubric is a "
+                         "bootstrap for unscored jobs, and a human or Desktop reading titles "
+                         "one at a time scores better than it does. Do not clobber that.")
+    args = ap.parse_args()
+
     db = Database()
+    where = "status = 'new' AND merged_into IS NULL"
+    if not args.rescore:
+        where += " AND fit_score IS NULL"     # untouched jobs only
     rows = db.conn.execute(
-        "SELECT id, company, title, location, salary_annual_max, fit_score FROM jobs "
-        "WHERE status = 'new' AND merged_into IS NULL").fetchall()
-    changed = 0
+        f"SELECT id, company, title, location, salary_annual_max, fit_score FROM jobs "
+        f"WHERE {where}").fetchall()
     for r in rows:
         s = score(r["company"], r["title"], r["location"], r["salary_annual_max"])
-        if s != r["fit_score"]:
-            changed += 1
         db.update_job(r["id"], fit_score=s)
-    print(f"scored {len(rows)} jobs; {changed} changed")
+    print(f"scored {len(rows)} previously-unscored job(s)"
+          if not args.rescore else f"re-scored {len(rows)} job(s), overwriting existing")
     db.close()
 
 
