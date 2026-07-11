@@ -1,0 +1,170 @@
+"""Deterministic posting extraction, one parser per sender layout.
+
+The links are the authoritative posting list where a board sends them: the
+anchor text IS the job title, so it cannot drift from what the body says.
+Company, location and salary are then read from the body around that title.
+"""
+import re, json
+
+SKIP = "messages-noreply"
+FOOTER = ("See all jobs", "View all jobs", "GET MORE RECOMMENDATIONS",
+          "Get the new LinkedIn", "This email was intended", "Discover more jobs",
+          "Getting these notifications")
+MIDDOT = "·"
+SALARY = re.compile(r"^\$\s?[\d,]")
+RATING = re.compile(r"^\d(\.\d)?$")          # Indeed's star rating line
+WORKTYPE = re.compile(r"^(In Office|Remote|Hybrid)\b", re.I)
+
+
+def clean(body: str) -> list[str]:
+    for stop in FOOTER:
+        if stop in body:
+            body = body.split(stop)[0]
+    out = []
+    for l in body.split("\n"):
+        l = l.replace("￼", " ").strip()
+        if not l or "͏" in l or set(l) <= {"͏", " "}:
+            continue
+        out.append(l)
+    return out
+
+
+def board_of(sender: str) -> str:
+    s = sender.lower()
+    if "linkedin" in s:
+        return "linkedin"
+    if "indeed" in s:
+        return "indeed"
+    if "builtin" in s:
+        return "builtin"
+    if "oracle" in s:
+        return "oracle"
+    return "direct"
+
+
+def _sal(lines, i):
+    for j in (i + 1, i + 2):
+        if j < len(lines) and SALARY.match(lines[j]):
+            return lines[j]
+    return None
+
+
+REMOTE_IN_TITLE = re.compile(r"\(remote\)", re.I)
+HAS_WORKTYPE = re.compile(r"\((remote|hybrid|on-?site)\)", re.I)
+
+
+def _fold_remote(title, location):
+    """LinkedIn writes "(Remote)" in the TITLE on some postings and on the
+    LOCATION line on others. Same fact, two places, two ids unless folded."""
+    if REMOTE_IN_TITLE.search(title) and not HAS_WORKTYPE.search(location):
+        return f"{location} (Remote)"
+    return location
+
+
+def linkedin(lines, links):
+    out = []
+    for i, l in enumerate(lines):
+        if MIDDOT not in l or i == 0:
+            continue
+        company, _, location = l.partition(MIDDOT)
+        title = lines[i - 1].strip()
+        if not title or SALARY.match(title) or MIDDOT in title:
+            continue
+        location = _fold_remote(title, location.strip() or "Unknown")
+        out.append(dict(company=company.strip(), title=title,
+                        location=location, salary=_sal(lines, i)))
+    return out
+
+
+def indeed(lines, links):
+    out = []
+    titles = {l["text"].strip(): l["url"] for l in links}
+    for i, l in enumerate(lines):
+        if l not in titles:
+            continue
+        j = i + 1
+        if j >= len(lines):
+            continue
+        company = lines[j]; j += 1
+        if j < len(lines) and RATING.match(lines[j]):
+            j += 1                                  # skip the star rating
+        location = lines[j] if j < len(lines) else "Unknown"
+        salary = lines[j + 1] if j + 1 < len(lines) and SALARY.match(lines[j + 1]) else None
+        out.append(dict(company=company, title=l, location=location or "Unknown",
+                        salary=salary, url=titles[l]))
+    return out
+
+
+def builtin(lines, links):
+    out = []
+    for i, l in enumerate(lines):
+        if not WORKTYPE.match(l) or i < 2:
+            continue
+        worktype, _, loc = l.partition(" ")
+        location = (loc.strip() or worktype).strip()
+        if worktype.lower() in ("remote",) and location.lower() in ("usa", "us"):
+            location = "Remote"
+        elif worktype.lower() != "remote":
+            location = loc.strip() or "Unknown"
+        out.append(dict(company=lines[i - 2], title=lines[i - 1],
+                        location=location, salary=_sal(lines, i)))
+    return out
+
+
+def oracle(lines, links):
+    try:
+        start = next(i for i, l in enumerate(lines) if "latest roles" in l.lower()) + 1
+    except StopIteration:
+        return []
+    return [dict(company="Oracle", title=l, location="Unknown", salary=None)
+            for l in lines[start:] if len(l) > 6 and not l.lower().startswith("hello")]
+
+
+# "CHICAGO, IL, US, 60654-4203" -> "Chicago, IL". The country and the postcode
+# are noise, and a postcode in the key would split one job across two mailings.
+ZIPPY = re.compile(r"^(.*?,\s*[A-Z]{2})\s*,\s*US.*$", re.I)
+
+
+def _clean_direct_location(loc: str) -> str:
+    m = ZIPPY.match(loc.strip())
+    city_state = m.group(1) if m else loc.strip()
+    city, _, state = city_state.rpartition(",")
+    return f"{city.strip().title()}, {state.strip().upper()}" if city else city_state
+
+
+def direct(lines, links, preamble_company=None):
+    try:
+        start = next(i for i, l in enumerate(lines) if l.strip().lower() == "job matches:") + 1
+    except StopIteration:
+        return []
+    out = []
+    for l in lines[start:]:
+        if " - " not in l:
+            continue
+        title, _, loc = l.rpartition(" - ")
+        out.append(dict(company=preamble_company or "Unknown", title=title.strip(),
+                        location=_clean_direct_location(loc), salary=None))
+    return out
+
+
+PARSERS = dict(linkedin=linkedin, indeed=indeed, builtin=builtin, oracle=oracle)
+
+
+def company_from_preamble(lines):
+    """Direct-from-company mail names the employer only in prose or the domain."""
+    for l in lines[:6]:
+        for pat in (r"join(?:ed|ing) the (.+?) talent community",
+                    r"jobs? (?:posted )?from ([A-Z][\w &.\-]+)",
+                    r"at ([A-Z][\w &.\-]+?) (?:talent|careers)"):
+            m = re.search(pat, l, re.I)
+            if m:
+                return m.group(1).strip().rstrip("!.,")
+    return None
+
+
+def extract(sender, body, links):
+    board = board_of(sender)
+    lines = clean(body)
+    if board == "direct":
+        return direct(lines, links, company_from_preamble(lines)), board
+    return PARSERS[board](lines, links), board
