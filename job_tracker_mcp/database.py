@@ -1287,6 +1287,24 @@ class Database:
             out = self._update_one(self.conn, id, patch)
         return _err(out["message"]) if out["result"] == "error" else out
 
+    def set_bootstrap_score(self, id: str, fit_score: int) -> dict:
+        """Write a title-only bootstrap fit_score WITHOUT marking the job reviewed.
+
+        update_job() treats scoring a described job as its JD review and stamps
+        jd_reviewed_at (see _update_one). The title rubric in score_jobs.py is
+        never a JD review, so it must bypass that path -- otherwise running the
+        bootstrap after descriptions were fetched silently marks every job
+        reviewed and hides it from jobs_to_review. Bypassing keeps the bootstrap
+        safe to run in any order relative to the description fetch.
+        """
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE jobs SET fit_score = ?, updated_at = ? WHERE id = ?",
+                (fit_score, now_str(), id))
+        if cur.rowcount == 0:
+            return _err(f"No job with id {id}")
+        return {"result": "updated", "id": id, "fit_score": fit_score}
+
     def bulk_update_jobs(self, updates: list[dict]) -> dict:
         """Patch many jobs in ONE call. Each update is {id, ...fields}.
 

@@ -128,7 +128,11 @@ def main() -> None:
         f"WHERE {where}").fetchall()
     for r in rows:
         s = score(r["company"], r["title"], r["location"], r["salary_annual_max"])
-        db.update_job(r["id"], fit_score=s)
+        # set_bootstrap_score, NOT update_job: this is a title-only heuristic, not
+        # a JD review. Going through update_job would stamp jd_reviewed_at on any
+        # row that already has a description and hide it from jobs_to_review. This
+        # keeps scoring safe to run before OR after the description fetch.
+        db.set_bootstrap_score(r["id"], s)
     print(f"scored {len(rows)} previously-unscored job(s)"
           if not args.rescore else f"re-scored {len(rows)} job(s), overwriting existing")
     db.close()
