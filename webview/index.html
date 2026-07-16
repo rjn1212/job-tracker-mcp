@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Tracker</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --line: #e2e5ea; --ink: #1c2024;
+    --muted: #6b7280; --accent: #2563eb; --chip: #eef2ff; --hi: #f0f9ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1c2027; --line: #2c313a; --ink: #e6e8eb;
+      --muted: #9aa3ad; --accent: #6ea8fe; --chip: #23304a; --hi: #1b2735;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  header { padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+           position: sticky; top: 0; z-index: 5; }
+  h1 { margin: 0 0 12px; font-size: 18px; }
+  .filters { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: flex-end; }
+  .filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .filters input, .filters select {
+    font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--ink); min-width: 130px; }
+  .filters input[type=number] { min-width: 90px; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
+           background: var(--bg); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .count { margin-left: auto; font-size: 13px; color: var(--muted); white-space: nowrap; }
+  main { padding: 0 20px 40px; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { position: sticky; top: 0; text-align: left; font-size: 12px; color: var(--muted);
+             font-weight: 600; padding: 10px 10px; border-bottom: 1px solid var(--line); background: var(--bg); }
+  tbody tr.row { border-bottom: 1px solid var(--line); cursor: pointer; }
+  tbody tr.row:hover { background: var(--hi); }
+  td { padding: 9px 10px; vertical-align: top; }
+  td.score { font-weight: 700; text-align: center; width: 56px; }
+  td.role { font-weight: 600; }
+  td.company { color: var(--muted); white-space: nowrap; }
+  td.seen, td.dlen { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+         background: var(--chip); color: var(--accent); margin-left: 8px; vertical-align: middle; }
+  .detail td { background: var(--hi); border-bottom: 1px solid var(--line); }
+  .detail .meta { color: var(--muted); margin-bottom: 8px; font-size: 13px; }
+  .detail a { color: var(--accent); }
+  .desc { white-space: pre-wrap; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+          max-height: 460px; overflow: auto; padding: 10px 12px; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 6px; }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .caret { display: inline-block; width: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Job Tracker</h1>
+  <div class="filters">
+    <label>First seen since
+      <input type="date" id="since">
+    </label>
+    <label>Min JD score
+      <input type="number" id="min_score" min="0" max="10" step="1" placeholder="0">
+    </label>
+    <label>Min description length (chars)
+      <input type="number" id="min_desc_len" min="0" step="100" placeholder="0">
+    </label>
+    <label>Status
+      <select id="status">
+        <option value="">all</option>
+        <option value="new">new</option>
+        <option value="applied">applied</option>
+        <option value="expired">expired</option>
+        <option value="rejected">rejected</option>
+      </select>
+    </label>
+    <label>Sort by
+      <select id="sort">
+        <option value="date">Newest first</option>
+        <option value="score">Highest JD score</option>
+      </select>
+    </label>
+    <button id="reset">Reset</button>
+    <span class="count" id="count"></span>
+  </div>
+</header>
+<main>
+  <table>
+    <thead><tr>
+      <th style="width:24px"></th>
+      <th>Role</th><th style="text-align:center">Score</th><th>Company</th>
+      <th>First seen</th><th>Desc</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>No jobs match these filters.</div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const controls = ["since", "min_score", "min_desc_len", "status", "sort"];
+const rowsEl = $("rows"), emptyEl = $("empty"), countEl = $("count");
+
+function fmtSalary(j) { return j.salary_raw || ""; }
+
+function detailRow(job) {
+  const tr = document.createElement("tr");
+  tr.className = "detail";
+  const td = document.createElement("td");
+  td.colSpan = 6;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const bits = [];
+  if (job.status) bits.push("status: " + job.status);
+  if (job.source) bits.push("source: " + job.source);
+  if (fmtSalary(job)) bits.push("salary: " + fmtSalary(job));
+  if (job.last_seen) bits.push("last seen: " + job.last_seen);
+  bits.push("description: " + job.desc_len + " chars");
+  meta.textContent = bits.join("   ·   ");
+  td.appendChild(meta);
+
+  // Only link http(s) URLs. job.url is scraped, untrusted content; a
+  // "javascript:" or "data:" href would execute on click (target/rel do not
+  // stop that). Anything else is shown as plain, inert text.
+  if (job.url) {
+    const p = document.createElement("div"); p.style.marginBottom = "8px";
+    if (/^https?:\/\//i.test(job.url)) {
+      const a = document.createElement("a");
+      a.href = job.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.textContent = "Open posting ↗";
+      p.appendChild(a);
+    } else {
+      p.textContent = job.url;
+    }
+    td.appendChild(p);
+  }
+
+  const desc = document.createElement("div");
+  desc.className = "desc";
+  desc.textContent = job.description ? job.description : "(no description on file)";
+  td.appendChild(desc);
+
+  tr.appendChild(td);
+  return tr;
+}
+
+function render(data) {
+  rowsEl.textContent = "";
+  countEl.textContent = data.count + (data.count === 1 ? " job" : " jobs");
+  emptyEl.hidden = data.count !== 0;
+
+  for (const job of data.jobs) {
+    const tr = document.createElement("tr");
+    tr.className = "row";
+
+    const caret = document.createElement("td");
+    caret.innerHTML = '<span class="caret">▸</span>';
+
+    const role = document.createElement("td");
+    role.className = "role";
+    role.textContent = job.title || "(untitled)";
+
+    const score = document.createElement("td");
+    score.className = "score";
+    score.textContent = (job.fit_score === null || job.fit_score === undefined) ? "—" : job.fit_score;
+
+    const company = document.createElement("td");
+    company.className = "company";
+    company.textContent = job.company || "";
+
+    const seen = document.createElement("td");
+    seen.className = "seen";
+    seen.textContent = job.date_seen || "";
+
+    const dlen = document.createElement("td");
+    dlen.className = "dlen";
+    dlen.textContent = job.desc_len ? job.desc_len.toLocaleString() : "—";
+
+    tr.append(caret, role, score, company, seen, dlen);
+    rowsEl.appendChild(tr);
+
+    let detail = null;
+    tr.addEventListener("click", () => {
+      if (detail) { detail.remove(); detail = null; caret.firstChild.textContent = "▸"; return; }
+      detail = detailRow(job);
+      tr.after(detail);
+      caret.firstChild.textContent = "▾";
+    });
+  }
+}
+
+function params() {
+  const p = new URLSearchParams();
+  for (const id of controls) {
+    const v = $(id).value.trim();
+    if (v) p.set(id, v);
+  }
+  return p.toString();
+}
+
+let timer = null, gen = 0;
+async function load() {
+  const mine = ++gen;                       // ignore responses a newer request superseded
+  try {
+    const res = await fetch("/api/jobs?" + params());
+    const data = await res.json();
+    if (mine !== gen) return;
+    if (data.error) { countEl.textContent = "error: " + data.error; return; }
+    render(data);
+  } catch (e) {
+    if (mine === gen) countEl.textContent = "load failed: " + e;
+  }
+}
+function schedule() { clearTimeout(timer); timer = setTimeout(load, 180); }
+
+controls.forEach(id => {
+  const el = $(id);
+  el.addEventListener("input", schedule);
+  el.addEventListener("change", schedule);
+});
+$("reset").addEventListener("click", () => {
+  controls.forEach(id => { $(id).value = id === "sort" ? "date" : ""; });
+  load();
+});
+
+load();
+</script>
+</body>
+</html>
