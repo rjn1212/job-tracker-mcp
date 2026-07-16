@@ -76,6 +76,13 @@
         <option value="rejected">rejected</option>
       </select>
     </label>
+    <label>Applied?
+      <select id="applied">
+        <option value="">any</option>
+        <option value="yes">applied only</option>
+        <option value="no">not applied</option>
+      </select>
+    </label>
     <label>Sort by
       <select id="sort">
         <option value="date">Newest first</option>
@@ -91,7 +98,7 @@
     <thead><tr>
       <th style="width:24px"></th>
       <th>Role</th><th style="text-align:center">Score</th><th>Company</th>
-      <th>First seen</th><th>Desc</th>
+      <th>First seen</th><th>Applied</th><th>Desc</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -101,21 +108,44 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const controls = ["since", "min_score", "min_desc_len", "status", "sort"];
+const controls = ["since", "min_score", "min_desc_len", "status", "applied", "sort"];
 const rowsEl = $("rows"), emptyEl = $("empty"), countEl = $("count");
 
 function fmtSalary(j) { return j.salary_raw || ""; }
+
+function flash(btn, msg) {
+  btn.textContent = msg;
+  setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+}
+
+async function copyToClipboard(text) {
+  // 127.0.0.1 is a secure context, so the async Clipboard API works; keep a
+  // textarea+execCommand fallback for anything that lacks it.
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("execCommand copy failed");
+  } finally {
+    ta.remove();
+  }
+}
 
 function detailRow(job) {
   const tr = document.createElement("tr");
   tr.className = "detail";
   const td = document.createElement("td");
-  td.colSpan = 6;
+  td.colSpan = 7;
 
   const meta = document.createElement("div");
   meta.className = "meta";
   const bits = [];
   if (job.status) bits.push("status: " + job.status);
+  if (job.date_applied) bits.push("applied: " + job.date_applied);
   if (job.source) bits.push("source: " + job.source);
   if (fmtSalary(job)) bits.push("salary: " + fmtSalary(job));
   if (job.last_seen) bits.push("last seen: " + job.last_seen);
@@ -123,21 +153,38 @@ function detailRow(job) {
   meta.textContent = bits.join("   ·   ");
   td.appendChild(meta);
 
-  // Only link http(s) URLs. job.url is scraped, untrusted content; a
-  // "javascript:" or "data:" href would execute on click (target/rel do not
-  // stop that). Anything else is shown as plain, inert text.
+  // Actions row: Copy ("Company - Role" + blank line + description) and, for
+  // http(s) URLs only, the posting link. job.url is scraped/untrusted, so a
+  // "javascript:"/"data:" href (which would execute on click) is shown inert.
+  const actions = document.createElement("div");
+  actions.style.cssText = "margin-bottom:8px; display:flex; gap:14px; align-items:center;";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.textContent = "Copy";
+  copyBtn.title = "Copy “Company - Role” then the description";
+  copyBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const text = (job.company || "") + " - " + (job.title || "") +
+                 "\n\n" + (job.description || "");
+    copyToClipboard(text).then(
+      () => flash(copyBtn, "Copied!"),
+      () => flash(copyBtn, "Copy failed"));
+  });
+  actions.appendChild(copyBtn);
+
   if (job.url) {
-    const p = document.createElement("div"); p.style.marginBottom = "8px";
     if (/^https?:\/\//i.test(job.url)) {
       const a = document.createElement("a");
       a.href = job.url; a.target = "_blank"; a.rel = "noopener noreferrer";
       a.textContent = "Open posting ↗";
-      p.appendChild(a);
+      actions.appendChild(a);
     } else {
-      p.textContent = job.url;
+      const span = document.createElement("span");
+      span.className = "meta"; span.textContent = job.url;
+      actions.appendChild(span);
     }
-    td.appendChild(p);
   }
+  td.appendChild(actions);
 
   const desc = document.createElement("div");
   desc.className = "desc";
@@ -176,11 +223,15 @@ function render(data) {
     seen.className = "seen";
     seen.textContent = job.date_seen || "";
 
+    const applied = document.createElement("td");
+    applied.className = "seen";
+    applied.textContent = job.date_applied || "—";
+
     const dlen = document.createElement("td");
     dlen.className = "dlen";
     dlen.textContent = job.desc_len ? job.desc_len.toLocaleString() : "—";
 
-    tr.append(caret, role, score, company, seen, dlen);
+    tr.append(caret, role, score, company, seen, applied, dlen);
     rowsEl.appendChild(tr);
 
     let detail = null;

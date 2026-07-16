@@ -35,7 +35,7 @@ SORTS = {"date": "date_seen DESC, last_seen DESC",
 STATUSES = {"new", "applied", "expired", "rejected"}
 
 FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
-          "status", "source", "url", "salary_raw", "description")
+          "status", "source", "url", "salary_raw", "date_applied", "description")
 
 
 def connect():
@@ -66,6 +66,7 @@ def query_jobs(qs):
     min_score = _int(qs, "min_score", 0)
     min_desc_len = _int(qs, "min_desc_len", 0)
     status = qs.get("status", [""])[0].strip().lower()
+    applied = qs.get("applied", [""])[0].strip().lower()
     sort = qs.get("sort", ["date"])[0]
 
     where = ["merged_into IS NULL"]
@@ -78,6 +79,12 @@ def query_jobs(qs):
         where.append("COALESCE(LENGTH(description), 0) >= ?"); params.append(min_desc_len)
     if status in STATUSES:
         where.append("status = ?"); params.append(status)
+    # "applied" = has a date_applied (the durable signal; survives a later
+    # status change to expired/rejected).
+    if applied == "yes":
+        where.append("date_applied IS NOT NULL")
+    elif applied == "no":
+        where.append("date_applied IS NULL")
 
     order = SORTS.get(sort, SORTS["date"])
     sql = (f"SELECT {', '.join(FIELDS)} FROM jobs "
