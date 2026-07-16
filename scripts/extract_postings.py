@@ -162,9 +162,42 @@ def company_from_preamble(lines):
     return None
 
 
+def _norm(s):
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+
+def attach_urls(postings, links):
+    """Fill each posting's `url` from the message's links by matching anchor
+    text to the title. LinkedIn's anchor text IS the title; Built In's is
+    "Company Title". Indeed postings already carry a url from their own parser
+    and are left untouched. A posting with no matching link keeps url=None --
+    the alert body named a job the links section didn't, which is rare but must
+    not drop the posting.
+
+    This lives here, not in the caller, so every consumer of extract() gets
+    URL-complete postings without re-deriving the match.
+    """
+    by_text = {_norm(l["text"]): l["url"] for l in (links or [])}
+    for p in postings:
+        if p.get("url"):
+            continue
+        title = _norm(p["title"])
+        combined = _norm(f"{p.get('company', '')} {p['title']}")
+        if title in by_text:
+            p["url"] = by_text[title]
+        elif combined in by_text:
+            p["url"] = by_text[combined]
+        else:
+            p["url"] = next((u for t, u in by_text.items()
+                             if title and (title in t or t.endswith(title))), None)
+    return postings
+
+
 def extract(sender, body, links):
     board = board_of(sender)
     lines = clean(body)
     if board == "direct":
-        return direct(lines, links, company_from_preamble(lines)), board
-    return PARSERS[board](lines, links), board
+        postings = direct(lines, links, company_from_preamble(lines))
+    else:
+        postings = PARSERS[board](lines, links)
+    return attach_urls(postings, links), board
