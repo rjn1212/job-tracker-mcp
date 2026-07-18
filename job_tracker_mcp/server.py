@@ -88,6 +88,7 @@ def add_job(
     email_subject: str | None = None,
     date_seen: str | None = None,
     salary: str | None = None,
+    description: str | None = None,
 ) -> dict:
     """Add a job posting to the tracker.
 
@@ -123,10 +124,15 @@ def add_job(
     titles at the same employer. The job is still created. Inspect them and
     call merge_jobs if one is genuinely the same requisition.
 
+    Pass `description` to store the full posting text at creation. It is
+    optional and backfilled on a re-sighting (never clobbers an existing one);
+    without it the row is created description-less and a later
+    set_job_description / update_job fills it in.
+
     For a job alert email containing several postings, prefer bulk_add_jobs.
     """
     return db.add_job(company, title, location, url, source, fit_score, notes,
-                      email_subject, date_seen, salary)
+                      email_subject, date_seen, salary, description)
 
 
 @mcp.tool
@@ -139,7 +145,8 @@ def bulk_add_jobs(jobs: list[dict]) -> dict:
 
     Set `date_seen` on every entry to the alert email's date, not today. One
     call per email keeps that simple. Include `url` and `salary` when the email
-    supplies them -- see add_job.
+    supplies them, and `description` to store the full posting text at creation
+    (backfilled on a re-sighting) -- see add_job.
 
     Malformed entries do not abort the batch; each contributes an error to the
     per-entry `results` list, which preserves input order. Returns counts of

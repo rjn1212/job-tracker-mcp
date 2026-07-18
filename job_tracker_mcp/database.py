@@ -612,6 +612,7 @@ class Database:
         source = entry.get("source")
         notes = entry.get("notes")
         email_subject = entry.get("email_subject")
+        description = entry.get("description") or None
         sal = parse_salary(entry.get("salary"))
 
         c_canon = canonicalize_company(company)
@@ -619,6 +620,7 @@ class Database:
         l_canon = canonicalize_location(location)
         job_id = generate_job_id(company, title, location)
         today, now = today_str(), now_str()
+        desc_fetched = now if description else None
 
         row = self._resolve(cur, job_id)
         if row is not None:
@@ -641,11 +643,13 @@ class Database:
                 "salary_annual_min = COALESCE(salary_annual_min, ?), "
                 "salary_annual_max = COALESCE(salary_annual_max, ?), "
                 "salary_raw = COALESCE(salary_raw, ?), "
+                "description = COALESCE(description, ?), "
+                "description_fetched_at = COALESCE(description_fetched_at, ?), "
                 "updated_at = ? WHERE id = ?",
                 (first, last, row["url"] or url, row["source"] or source,
                  sal and sal["min"], sal and sal["max"], sal and sal["period"],
                  sal and sal["annual_min"], sal and sal["annual_max"],
-                 sal and sal["raw"], now, row["id"]),
+                 sal and sal["raw"], description, desc_fetched, now, row["id"]),
             )
             return {
                 "result": "duplicate",
@@ -675,14 +679,16 @@ class Database:
             "location, location_canonical, url, source, date_seen, last_seen, "
             "times_seen, date_applied, status, fit_score, salary_min, salary_max, "
             "salary_period, salary_annual_min, salary_annual_max, salary_raw, "
-            "notes, email_subject, merged_into, off_profile, created_at, updated_at) "
+            "notes, email_subject, merged_into, off_profile, created_at, updated_at, "
+            "description, description_fetched_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
             (job_id, company, c_canon, title, t_canon, location, l_canon, url, source,
              seen, seen, status, fit_score,
              sal and sal["min"], sal and sal["max"], sal and sal["period"],
              sal and sal["annual_min"], sal and sal["annual_max"], sal and sal["raw"],
-             notes, email_subject, 1 if off_profile else 0, now, now),
+             notes, email_subject, 1 if off_profile else 0, now, now,
+             description, desc_fetched),
         )
         result = {
             "result": "created",
@@ -717,11 +723,13 @@ class Database:
         email_subject: str | None = None,
         date_seen: str | None = None,
         salary: str | None = None,
+        description: str | None = None,
     ) -> dict:
         entry = dict(
             company=company, title=title, location=location, url=url,
             source=source, fit_score=fit_score, notes=notes,
             email_subject=email_subject, date_seen=date_seen, salary=salary,
+            description=description,
         )
         with self._lock, self.conn:
             cur = self.conn.cursor()
