@@ -67,6 +67,8 @@ def query_jobs(qs):
     min_desc_len = _int(qs, "min_desc_len", 0)
     status = qs.get("status", [""])[0].strip().lower()
     applied = qs.get("applied", [""])[0].strip().lower()
+    jobid = qs.get("jobid", [""])[0].strip().lower()
+    company = qs.get("company", [""])[0].strip().lower()
     sort = qs.get("sort", ["date"])[0]
 
     where = ["merged_into IS NULL"]
@@ -85,6 +87,12 @@ def query_jobs(qs):
         where.append("date_applied IS NOT NULL")
     elif applied == "no":
         where.append("date_applied IS NULL")
+    if jobid:
+        # substring "find" on the job id; ids are lowercase hex, input is lowered
+        where.append("instr(id, ?) > 0"); params.append(jobid)
+    if company:
+        # case-insensitive substring "find" on company name
+        where.append("instr(lower(company), ?) > 0"); params.append(company)
 
     order = SORTS.get(sort, SORTS["date"])
     sql = (f"SELECT {', '.join(FIELDS)} FROM jobs "
@@ -113,6 +121,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(payload)))
+        # no-store: the page and data are live and change often; never let the
+        # browser serve a stale cached copy (which looks like "filters do nothing").
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
 

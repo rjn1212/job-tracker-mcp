@@ -42,6 +42,8 @@
   td.role { font-weight: 600; }
   td.company { color: var(--muted); white-space: nowrap; }
   td.seen, td.dlen { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.jid { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); white-space: nowrap; user-select: all; }
+  td.salary { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
          background: var(--chip); color: var(--accent); margin-left: 8px; vertical-align: middle; }
   .detail td { background: var(--hi); border-bottom: 1px solid var(--line); }
@@ -58,6 +60,14 @@
 <header>
   <h1>Job Tracker</h1>
   <div class="filters">
+    <label>Company (find)
+      <input type="text" id="company" placeholder="type a company name" autocomplete="off"
+             spellcheck="false" style="min-width:180px">
+    </label>
+    <label>Job ID (find)
+      <input type="text" id="jobid" placeholder="paste or type an id" autocomplete="off"
+             spellcheck="false" style="min-width:190px;font-family:ui-monospace,Menlo,monospace">
+    </label>
     <label>First seen since
       <input type="date" id="since">
     </label>
@@ -97,8 +107,8 @@
   <table>
     <thead><tr>
       <th style="width:24px"></th>
-      <th>Role</th><th style="text-align:center">Score</th><th>Company</th>
-      <th>First seen</th><th>Applied</th><th>Desc</th>
+      <th>Role</th><th style="text-align:center">Score</th><th>Company</th><th>Salary</th>
+      <th>First seen</th><th>Applied</th><th>Desc</th><th>ID</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -108,10 +118,17 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const controls = ["since", "min_score", "min_desc_len", "status", "applied", "sort"];
+const controls = ["company", "jobid", "since", "min_score", "min_desc_len", "status", "applied", "sort"];
 const rowsEl = $("rows"), emptyEl = $("empty"), countEl = $("count");
 
-function fmtSalary(j) { return j.salary_raw || ""; }
+// Drop the redundant annual period ("a year" / "/ year" / "per year") for
+// display only -- salary_raw stays intact in the DB, and salary_period already
+// captures this structurally. Hourly suffixes are LEFT so those stay obvious.
+function cleanSalary(s) {
+  if (!s) return "";
+  return s.replace(/\s*(?:\/\s*|per\s+|a\s+)(?:year|yr|annum)\.?\s*$/i, "").trim();
+}
+function fmtSalary(j) { return cleanSalary(j.salary_raw); }
 
 function flash(btn, msg) {
   btn.textContent = msg;
@@ -139,7 +156,7 @@ function detailRow(job) {
   const tr = document.createElement("tr");
   tr.className = "detail";
   const td = document.createElement("td");
-  td.colSpan = 7;
+  td.colSpan = 9;
 
   const meta = document.createElement("div");
   meta.className = "meta";
@@ -219,6 +236,10 @@ function render(data) {
     company.className = "company";
     company.textContent = job.company || "";
 
+    const salary = document.createElement("td");
+    salary.className = "salary";
+    salary.textContent = cleanSalary(job.salary_raw) || "—";
+
     const seen = document.createElement("td");
     seen.className = "seen";
     seen.textContent = job.date_seen || "";
@@ -231,7 +252,11 @@ function render(data) {
     dlen.className = "dlen";
     dlen.textContent = job.desc_len ? job.desc_len.toLocaleString() : "—";
 
-    tr.append(caret, role, score, company, seen, applied, dlen);
+    const idcell = document.createElement("td");
+    idcell.className = "jid";
+    idcell.textContent = job.id;
+
+    tr.append(caret, role, score, company, salary, seen, applied, dlen, idcell);
     rowsEl.appendChild(tr);
 
     let detail = null;
