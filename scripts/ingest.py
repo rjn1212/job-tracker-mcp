@@ -21,6 +21,7 @@ triage run against the same DB at the same time.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -30,6 +31,15 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 
 from job_tracker_mcp.database import Database
 import extract_postings as ep
+
+# get_message_links' own job_links_only filter recognizes only LinkedIn/Indeed/
+# awstrack URLs and drops company careers links (e.g. jobs.grainger.com/job/...),
+# which left those postings with no url. So fetch links unfiltered and keep only
+# these posting-shaped URLs -- covers careers/ATS pages while excluding nav,
+# social, and preference links, so extract's anchor-text matching can't misfire.
+_JOB_URL = re.compile(r"(/job/|/jobs/view|viewjob|[?&]jk=|awstrack\.me|"
+                      r"myworkdayjobs\.com|greenhouse\.io|lever\.co|icims\.com|ashbyhq)",
+                      re.I)
 
 MAIL_BIN = os.environ.get("APPLE_MAIL_MCP", os.path.expanduser("~/.local/bin/apple-mail-mcp"))
 ACCOUNT = "RandyN Exchange"
@@ -95,8 +105,9 @@ def new_messages(mail, watermark):
 
 def postings_for(mail, msg):
     full = mail.call("get_message", message_id=msg["id"], include_content=True)["message"]
-    links = mail.call("get_message_links", message_id=msg["id"],
-                      job_links_only=True).get("links", [])
+    raw = mail.call("get_message_links", message_id=msg["id"],
+                    job_links_only=False).get("links", [])
+    links = [l for l in raw if _JOB_URL.search(l.get("url", ""))]
     postings, board = ep.extract(full.get("sender", ""), full.get("content", ""), links)
     for p in postings:
         p["source"] = board
