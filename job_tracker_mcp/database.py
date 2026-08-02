@@ -38,9 +38,23 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 MAX_LIMIT = 200
 MAX_BULK = 100
+
+# URLs that uniquely identify ONE posting, so a same-URL match means the same
+# job -- even when a differing location string produced a different id (e.g. one
+# LinkedIn posting listed under both "Chicago, IL" and "Elk Grove Village, IL").
+# Restricted to per-posting board URLs: a generic company career-page link can
+# be shared by several distinct roles, and folding those together would silently
+# destroy jobs.
+_PER_POSTING_URL = re.compile(
+    r"(?:linkedin\.com/jobs/view/|indeed\.com/\S*[?&]jk=|builtin\.com/job/)", re.I)
+
+
+def _is_per_posting_url(url):
+    return bool(url and _PER_POSTING_URL.search(url))
+
 
 # Titles at the same company whose word sets overlap at least this much are
 # surfaced as possible duplicates. Never auto-merged: a false split is a
@@ -87,6 +101,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- i.e. the score now reflects the actual posting, not just the title. Lets
     -- a review resume, and separates JD-scored jobs from title-only ones.
     jd_reviewed_at     TEXT,
+    -- When the employer posted the req, parsed from the JD page (Built In's
+    -- JSON-LD datePosted; best-effort elsewhere). NULL when unknown. Distinct
+    -- from date_seen, which is only when an alert first surfaced it to us.
+    date_posted        TEXT,
     notes              TEXT,
     email_subject      TEXT,
     merged_into        TEXT REFERENCES jobs(id),
@@ -244,7 +262,8 @@ class Database:
                  3: self._migrate_3_to_4, 4: self._migrate_4_to_5,
                  5: self._rebuild_ids, 6: self._rebuild_ids,
                  7: self._rebuild_ids, 8: self._migrate_8_to_9,
-                 9: self._migrate_9_to_10, 10: self._migrate_10_to_11}
+                 9: self._migrate_9_to_10, 10: self._migrate_10_to_11,
+                 11: self._migrate_11_to_12}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -307,6 +326,11 @@ class Database:
     def _migrate_10_to_11(self) -> None:
         if not self._has_column("jobs", "jd_reviewed_at"):
             self.conn.execute("ALTER TABLE jobs ADD COLUMN jd_reviewed_at TEXT")
+
+    def _migrate_11_to_12(self) -> None:
+        """Employer posted date, parsed from the JD page. Purely additive."""
+        if not self._has_column("jobs", "date_posted"):
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN date_posted TEXT")
 
     def _rebuild_ids(self) -> None:
         """Recompute every id from the current canonicalizers.
@@ -613,6 +637,9 @@ class Database:
         notes = entry.get("notes")
         email_subject = entry.get("email_subject")
         description = entry.get("description") or None
+        date_posted = (entry.get("date_posted") or "").strip()[:10] or None
+        if date_posted and (msg := self._bad_date(date_posted)):
+            return {"result": "error", "message": f"date_posted: {msg}"}
         sal = parse_salary(entry.get("salary"))
 
         c_canon = canonicalize_company(company)
@@ -623,6 +650,16 @@ class Database:
         desc_fetched = now if description else None
 
         row = self._resolve(cur, job_id)
+        if row is None and _is_per_posting_url(url):
+            # Same per-posting URL = the same job even when a differing location
+            # string produced a different id. Re-sight the existing row rather
+            # than create a near-duplicate. Scoped to same company as a guard,
+            # and to the earliest row so the primary survives.
+            row = cur.execute(
+                "SELECT * FROM jobs WHERE url = ? AND company_canonical = ? "
+                "AND merged_into IS NULL ORDER BY date_seen LIMIT 1",
+                (url, c_canon),
+            ).fetchone()
         if row is not None:
             # Backfill nulls only. A re-sighting must never clobber a triage
             # decision (status, fit_score, notes) or the display strings.
@@ -645,11 +682,13 @@ class Database:
                 "salary_raw = COALESCE(salary_raw, ?), "
                 "description = COALESCE(description, ?), "
                 "description_fetched_at = COALESCE(description_fetched_at, ?), "
+                "date_posted = COALESCE(date_posted, ?), "
                 "updated_at = ? WHERE id = ?",
                 (first, last, row["url"] or url, row["source"] or source,
                  sal and sal["min"], sal and sal["max"], sal and sal["period"],
                  sal and sal["annual_min"], sal and sal["annual_max"],
-                 sal and sal["raw"], description, desc_fetched, now, row["id"]),
+                 sal and sal["raw"], description, desc_fetched, date_posted,
+                 now, row["id"]),
             )
             return {
                 "result": "duplicate",
@@ -680,15 +719,15 @@ class Database:
             "times_seen, date_applied, status, fit_score, salary_min, salary_max, "
             "salary_period, salary_annual_min, salary_annual_max, salary_raw, "
             "notes, email_subject, merged_into, off_profile, created_at, updated_at, "
-            "description, description_fetched_at) "
+            "description, description_fetched_at, date_posted) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             (job_id, company, c_canon, title, t_canon, location, l_canon, url, source,
              seen, seen, status, fit_score,
              sal and sal["min"], sal and sal["max"], sal and sal["period"],
              sal and sal["annual_min"], sal and sal["annual_max"], sal and sal["raw"],
              notes, email_subject, 1 if off_profile else 0, now, now,
-             description, desc_fetched),
+             description, desc_fetched, date_posted),
         )
         result = {
             "result": "created",
@@ -724,12 +763,13 @@ class Database:
         date_seen: str | None = None,
         salary: str | None = None,
         description: str | None = None,
+        date_posted: str | None = None,
     ) -> dict:
         entry = dict(
             company=company, title=title, location=location, url=url,
             source=source, fit_score=fit_score, notes=notes,
             email_subject=email_subject, date_seen=date_seen, salary=salary,
-            description=description,
+            description=description, date_posted=date_posted,
         )
         with self._lock, self.conn:
             cur = self.conn.cursor()
@@ -1378,15 +1418,20 @@ class Database:
 
     # ----------------------------------------------------- job descriptions
 
-    def set_job_description(self, id: str, text: str) -> dict:
+    def set_job_description(self, id: str, text: str,
+                            date_posted: str | None = None) -> dict:
         """Cache the full posting text an agent fetched from the job's url.
 
         Written once and read offline thereafter -- the alert email never
         carries the description, and re-fetching a live posting is what this
-        cache exists to avoid.
+        cache exists to avoid. Pass `date_posted` (YYYY-MM-DD) when the JD page
+        states when the req was posted -- it is backfilled, never overwritten.
         """
         if not text or not text.strip():
             return _err("text must not be empty")
+        dp = (date_posted or "").strip()[:10] or None
+        if dp and (msg := self._bad_date(dp)):
+            return _err(f"date_posted: {msg}")
         with self._lock, self.conn:
             row = self.conn.execute("SELECT merged_into FROM jobs WHERE id = ?", (id,)).fetchone()
             if row is None:
@@ -1394,8 +1439,9 @@ class Database:
             if row["merged_into"]:
                 return _err(self._merged_err(dict(id=id, merged_into=row["merged_into"])))
             self.conn.execute(
-                "UPDATE jobs SET description = ?, description_fetched_at = ?, updated_at = ? "
-                "WHERE id = ?", (text, now_str(), now_str(), id))
+                "UPDATE jobs SET description = ?, description_fetched_at = ?, "
+                "date_posted = COALESCE(date_posted, ?), updated_at = ? "
+                "WHERE id = ?", (text, now_str(), dp, now_str(), id))
         return {"result": "stored", "id": id, "chars": len(text)}
 
     def jobs_needing_description(self, within_days: int = 14, min_fit: int = 7,

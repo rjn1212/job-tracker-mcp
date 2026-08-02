@@ -39,38 +39,53 @@ def clean(fragment: str) -> str:
     return re.sub(r"\n\s*\n+", "\n\n", txt).strip()
 
 
+_DATE_POSTED = re.compile(r'"datePosted"\s*:\s*"(\d{4}-\d{2}-\d{2})')
+
+
+def posted_date(text):
+    """Best-effort employer posted date. Built In embeds an ISO `datePosted` in
+    its JSON-LD; LinkedIn's guest API usually carries only a relative "N days
+    ago", which we deliberately skip rather than store an approximate date."""
+    m = _DATE_POSTED.search(text)
+    return m.group(1) if m else None
+
+
+# Each fetcher returns (text, date_posted): text is the JD (or "__ERR__..."),
+# date_posted is an ISO date or None.
 def linkedin(client, url):
     m = re.search(r"/jobs/view/(\d+)", url)
     if not m:
-        return None
+        return None, None
     r = client.get(f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}")
     if r.status_code != 200:
-        return f"__ERR__{r.status_code}"
+        return f"__ERR__{r.status_code}", None
+    posted = posted_date(r.text)
     blk = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>', r.text, re.S)
     body = clean(blk.group(1)) if blk else ""
     crit = re.findall(r'description__job-criteria-subheader[^>]*>(.*?)</h3>.*?'
                       r'description__job-criteria-text[^>]*>(.*?)</span>', r.text, re.S)
     extra = "\n".join(f"{clean(k)}: {clean(v)}" for k, v in crit)
     full = (body + ("\n\n" + extra if extra else "")).strip()
-    return full or "__ERR__empty"
+    return (full or "__ERR__empty"), posted
 
 
 def builtin(client, url):
     r = client.get(url)
     if r.status_code != 200:
-        return f"__ERR__{r.status_code}"
+        return f"__ERR__{r.status_code}", None
+    posted = posted_date(r.text)
     # Built In embeds a schema.org JobPosting; its `description` is the JD as
     # HTML. This is stable across page redesigns -- the old content-div scrape
     # (job-post-item-description) broke when that container was removed.
     m = re.search(r'"@type"\s*:\s*"JobPosting".*?"description"\s*:\s*"((?:[^"\\]|\\.)*)"',
                   r.text, re.S)
     if m:
-        return clean(json.loads('"' + m.group(1) + '"')) or "__ERR__empty"
+        return (clean(json.loads('"' + m.group(1) + '"')) or "__ERR__empty"), posted
     # fallback: older content-block scrape, in case a page lacks the JSON-LD
     m = re.search(r'(?is)job-post-item-description.*?>(.*?)</(?:div|section|article)>', r.text)
     if not m:
         m = re.search(r'(?is)<section[^>]*>(.*?)</section>', r.text)
-    return (clean(m.group(1)) if m else "") or "__ERR__empty"
+    return ((clean(m.group(1)) if m else "") or "__ERR__empty"), posted
 
 
 FETCHERS = {"linkedin": linkedin, "builtin": builtin}
@@ -108,19 +123,22 @@ def main():
                 if wait > 0:
                     time.sleep(wait)
                 try:
-                    text = FETCHERS[host](client, j["url"])
+                    text, posted = FETCHERS[host](client, j["url"])
                 except Exception as e:  # noqa: BLE001
-                    text = f"__ERR__{type(e).__name__}"
+                    text, posted = f"__ERR__{type(e).__name__}", None
                 last_hit[host] = time.monotonic()
                 if not text or text.startswith("__ERR__") or len(text) < 120:
                     err += 1
                     print(f"  MISS [{host}] {j['company'][:20]:20} {j['title'][:30]:30} "
                           f"{text[:16] if text else 'none'}")
                     continue
-                db.set_job_description(j["id"], text[:8000])
+                db.set_job_description(j["id"], text[:8000], date_posted=posted)
                 done += 1
     db.close()
     print(f"\n  stored {done}, missed {err}, deferred {len(deferred)} to WebFetch (Indeed/other)")
+    # The WebFetch step that handles these should also read the posting's stated
+    # date and pass it: set_job_description(id, text, date_posted="YYYY-MM-DD").
+    # Indeed usually shows a relative "posted N days ago"; only store an exact date.
     json.dump(deferred, open("/tmp/jd_indeed.json", "w"))
 
 
