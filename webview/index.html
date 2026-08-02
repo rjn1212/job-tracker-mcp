@@ -97,6 +97,7 @@
       <select id="sort">
         <option value="date">Newest first</option>
         <option value="score">Highest JD score</option>
+        <option value="applied">Applied date (recent)</option>
       </select>
     </label>
     <button id="reset">Reset</button>
@@ -108,7 +109,7 @@
     <thead><tr>
       <th style="width:24px"></th>
       <th>Role</th><th style="text-align:center">Score</th><th>Company</th><th>Salary</th>
-      <th>First seen</th><th>Applied</th><th>Desc</th><th>ID</th>
+      <th>First seen</th><th>Posted</th><th>Applied</th><th>Desc</th><th>ID</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -156,7 +157,7 @@ function detailRow(job) {
   const tr = document.createElement("tr");
   tr.className = "detail";
   const td = document.createElement("td");
-  td.colSpan = 9;
+  td.colSpan = 10;
 
   const meta = document.createElement("div");
   meta.className = "meta";
@@ -244,6 +245,10 @@ function render(data) {
     seen.className = "seen";
     seen.textContent = job.date_seen || "";
 
+    const posted = document.createElement("td");
+    posted.className = "seen";
+    posted.textContent = job.date_posted || "—";
+
     const applied = document.createElement("td");
     applied.className = "seen";
     applied.textContent = job.date_applied || "—";
@@ -256,7 +261,7 @@ function render(data) {
     idcell.className = "jid";
     idcell.textContent = job.id;
 
-    tr.append(caret, role, score, company, salary, seen, applied, dlen, idcell);
+    tr.append(caret, role, score, company, salary, seen, posted, applied, dlen, idcell);
     rowsEl.appendChild(tr);
 
     let detail = null;

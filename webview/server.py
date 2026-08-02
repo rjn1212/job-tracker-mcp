@@ -31,11 +31,14 @@ HOST = "127.0.0.1"
 MAX_ROWS = 5000
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SORTS = {"date": "date_seen DESC, last_seen DESC",
-         "score": "fit_score DESC, date_seen DESC"}
+         "score": "fit_score DESC, date_seen DESC",
+         # applied date, most recent first; un-applied (NULL) sink last in DESC
+         "applied": "date_applied DESC, date_seen DESC"}
 STATUSES = {"new", "applied", "expired", "rejected"}
 
 FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
-          "status", "source", "url", "salary_raw", "date_applied", "description")
+          "status", "source", "url", "salary_raw", "date_applied", "date_posted",
+          "description")
 
 
 def connect():
