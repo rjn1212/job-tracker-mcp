@@ -38,7 +38,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -105,6 +105,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- JSON-LD datePosted; best-effort elsewhere). NULL when unknown. Distinct
     -- from date_seen, which is only when an alert first surfaced it to us.
     date_posted        TEXT,
+    -- The posting's stated expiry (schema.org validThrough) when the JD page
+    -- gives one. A best-before, not a guarantee the req is still open.
+    valid_through      TEXT,
     notes              TEXT,
     email_subject      TEXT,
     merged_into        TEXT REFERENCES jobs(id),
@@ -263,7 +266,7 @@ class Database:
                  5: self._rebuild_ids, 6: self._rebuild_ids,
                  7: self._rebuild_ids, 8: self._migrate_8_to_9,
                  9: self._migrate_9_to_10, 10: self._migrate_10_to_11,
-                 11: self._migrate_11_to_12}
+                 11: self._migrate_11_to_12, 12: self._migrate_12_to_13}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -331,6 +334,11 @@ class Database:
         """Employer posted date, parsed from the JD page. Purely additive."""
         if not self._has_column("jobs", "date_posted"):
             self.conn.execute("ALTER TABLE jobs ADD COLUMN date_posted TEXT")
+
+    def _migrate_12_to_13(self) -> None:
+        """Posting expiry (validThrough), parsed from the JD page. Additive."""
+        if not self._has_column("jobs", "valid_through"):
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN valid_through TEXT")
 
     def _rebuild_ids(self) -> None:
         """Recompute every id from the current canonicalizers.
@@ -640,6 +648,9 @@ class Database:
         date_posted = (entry.get("date_posted") or "").strip()[:10] or None
         if date_posted and (msg := self._bad_date(date_posted)):
             return {"result": "error", "message": f"date_posted: {msg}"}
+        valid_through = (entry.get("valid_through") or "").strip()[:10] or None
+        if valid_through and (msg := self._bad_date(valid_through)):
+            return {"result": "error", "message": f"valid_through: {msg}"}
         sal = parse_salary(entry.get("salary"))
 
         c_canon = canonicalize_company(company)
@@ -683,12 +694,13 @@ class Database:
                 "description = COALESCE(description, ?), "
                 "description_fetched_at = COALESCE(description_fetched_at, ?), "
                 "date_posted = COALESCE(date_posted, ?), "
+                "valid_through = COALESCE(valid_through, ?), "
                 "updated_at = ? WHERE id = ?",
                 (first, last, row["url"] or url, row["source"] or source,
                  sal and sal["min"], sal and sal["max"], sal and sal["period"],
                  sal and sal["annual_min"], sal and sal["annual_max"],
                  sal and sal["raw"], description, desc_fetched, date_posted,
-                 now, row["id"]),
+                 valid_through, now, row["id"]),
             )
             return {
                 "result": "duplicate",
@@ -719,15 +731,15 @@ class Database:
             "times_seen, date_applied, status, fit_score, salary_min, salary_max, "
             "salary_period, salary_annual_min, salary_annual_max, salary_raw, "
             "notes, email_subject, merged_into, off_profile, created_at, updated_at, "
-            "description, description_fetched_at, date_posted) "
+            "description, description_fetched_at, date_posted, valid_through) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
             (job_id, company, c_canon, title, t_canon, location, l_canon, url, source,
              seen, seen, status, fit_score,
              sal and sal["min"], sal and sal["max"], sal and sal["period"],
              sal and sal["annual_min"], sal and sal["annual_max"], sal and sal["raw"],
              notes, email_subject, 1 if off_profile else 0, now, now,
-             description, desc_fetched, date_posted),
+             description, desc_fetched, date_posted, valid_through),
         )
         result = {
             "result": "created",
@@ -764,12 +776,14 @@ class Database:
         salary: str | None = None,
         description: str | None = None,
         date_posted: str | None = None,
+        valid_through: str | None = None,
     ) -> dict:
         entry = dict(
             company=company, title=title, location=location, url=url,
             source=source, fit_score=fit_score, notes=notes,
             email_subject=email_subject, date_seen=date_seen, salary=salary,
             description=description, date_posted=date_posted,
+            valid_through=valid_through,
         )
         with self._lock, self.conn:
             cur = self.conn.cursor()
@@ -1419,19 +1433,24 @@ class Database:
     # ----------------------------------------------------- job descriptions
 
     def set_job_description(self, id: str, text: str,
-                            date_posted: str | None = None) -> dict:
+                            date_posted: str | None = None,
+                            valid_through: str | None = None) -> dict:
         """Cache the full posting text an agent fetched from the job's url.
 
         Written once and read offline thereafter -- the alert email never
         carries the description, and re-fetching a live posting is what this
-        cache exists to avoid. Pass `date_posted` (YYYY-MM-DD) when the JD page
-        states when the req was posted -- it is backfilled, never overwritten.
+        cache exists to avoid. Pass `date_posted` / `valid_through`
+        (YYYY-MM-DD) when the JD page states them -- both are backfilled,
+        never overwritten.
         """
         if not text or not text.strip():
             return _err("text must not be empty")
         dp = (date_posted or "").strip()[:10] or None
         if dp and (msg := self._bad_date(dp)):
             return _err(f"date_posted: {msg}")
+        vt = (valid_through or "").strip()[:10] or None
+        if vt and (msg := self._bad_date(vt)):
+            return _err(f"valid_through: {msg}")
         with self._lock, self.conn:
             row = self.conn.execute("SELECT merged_into FROM jobs WHERE id = ?", (id,)).fetchone()
             if row is None:
@@ -1440,8 +1459,9 @@ class Database:
                 return _err(self._merged_err(dict(id=id, merged_into=row["merged_into"])))
             self.conn.execute(
                 "UPDATE jobs SET description = ?, description_fetched_at = ?, "
-                "date_posted = COALESCE(date_posted, ?), updated_at = ? "
-                "WHERE id = ?", (text, now_str(), dp, now_str(), id))
+                "date_posted = COALESCE(date_posted, ?), "
+                "valid_through = COALESCE(valid_through, ?), updated_at = ? "
+                "WHERE id = ?", (text, now_str(), dp, vt, now_str(), id))
         return {"result": "stored", "id": id, "chars": len(text)}
 
     def jobs_needing_description(self, within_days: int = 14, min_fit: int = 7,

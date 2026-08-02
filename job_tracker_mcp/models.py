@@ -61,7 +61,7 @@ JOB_FIELDS = (
     "status", "fit_score", "salary_min", "salary_max", "salary_period",
     "salary_annual_min", "salary_annual_max", "salary_raw",
     "description", "description_fetched_at", "jd_reviewed_at", "date_posted",
-    "notes", "email_subject", "merged_into",
+    "valid_through", "notes", "email_subject", "merged_into",
     "off_profile", "created_at", "updated_at",
 )
 

@@ -90,6 +90,7 @@ def add_job(
     salary: str | None = None,
     description: str | None = None,
     date_posted: str | None = None,
+    valid_through: str | None = None,
 ) -> dict:
     """Add a job posting to the tracker.
 
@@ -138,7 +139,8 @@ def add_job(
     For a job alert email containing several postings, prefer bulk_add_jobs.
     """
     return db.add_job(company, title, location, url, source, fit_score, notes,
-                      email_subject, date_seen, salary, description, date_posted)
+                      email_subject, date_seen, salary, description, date_posted,
+                      valid_through)
 
 
 @mcp.tool
@@ -693,17 +695,18 @@ def jobs_to_review(within_days: int = 14, limit: int = 25) -> dict:
 
 @mcp.tool
 @_tool_guard
-def set_job_description(id: str, text: str, date_posted: str | None = None) -> dict:
+def set_job_description(id: str, text: str, date_posted: str | None = None,
+                        valid_through: str | None = None) -> dict:
     """Cache the full posting text fetched from a job's url.
 
     Written once, read offline forever after. This is what turns "score a
     title" into "score a job": after storing, re-score with
     update_job(id, fit_score=N) against the real requirements.
 
-    Pass `date_posted` (YYYY-MM-DD) if the JD page states when the req was
-    posted -- it is backfilled onto the job, never overwritten.
+    Pass `date_posted` / `valid_through` (YYYY-MM-DD) if the JD page states the
+    posted or expiry date -- both are backfilled onto the job, never overwritten.
     """
-    return db.set_job_description(id, text, date_posted)
+    return db.set_job_description(id, text, date_posted, valid_through)
 
 
 # ---------------------------------------------------------------------------
