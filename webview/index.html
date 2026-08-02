@@ -44,6 +44,7 @@
   td.seen, td.dlen { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
   td.jid { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); white-space: nowrap; user-select: all; }
   tbody tr.rejected td.role { text-decoration: line-through; color: var(--muted); }
+  tbody tr.onhold td.role { font-style: italic; color: var(--muted); }
   td.salary { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
          background: var(--chip); color: var(--accent); margin-left: 8px; vertical-align: middle; }
@@ -85,6 +86,7 @@
         <option value="applied">applied</option>
         <option value="expired">expired</option>
         <option value="rejected">rejected</option>
+        <option value="hold">hold</option>
       </select>
     </label>
     <label>Applied?
@@ -191,24 +193,29 @@ function detailRow(job) {
   });
   actions.appendChild(copyBtn);
 
-  const rejected = job.status === "rejected";
-  const rejectBtn = document.createElement("button");
-  rejectBtn.textContent = rejected ? "Un-reject" : "Reject";
-  rejectBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    rejectBtn.disabled = true;
-    fetch("/api/reject", {
-      method: "POST",
-      headers: {"Content-Type": "application/x-www-form-urlencoded"},
-      body: "id=" + encodeURIComponent(job.id) + "&action=" + (rejected ? "unreject" : "reject"),
-    }).then(r => r.json()).then(res => {
-      if (res.error || res.result === "error") {
-        rejectBtn.textContent = "Error"; rejectBtn.disabled = false; return;
-      }
-      load();   // re-render with the new status
-    }).catch(() => { rejectBtn.textContent = "Failed"; rejectBtn.disabled = false; });
-  });
-  actions.appendChild(rejectBtn);
+  // Status actions -- each posts to /api/status and re-renders. Which buttons
+  // show depends on the current status: Hold is only offered for a 'new' job.
+  function actionBtn(label, action) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      b.disabled = true;
+      fetch("/api/status", {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: "id=" + encodeURIComponent(job.id) + "&action=" + action,
+      }).then(r => r.json()).then(res => {
+        if (res.error || res.result === "error") { b.textContent = "Error"; b.disabled = false; return; }
+        load();   // re-render with the new status
+      }).catch(() => { b.textContent = "Failed"; b.disabled = false; });
+    });
+    actions.appendChild(b);
+  }
+  if (job.status === "new") { actionBtn("Hold", "hold"); actionBtn("Reject", "reject"); }
+  else if (job.status === "hold") { actionBtn("Un-hold", "unhold"); }
+  else if (job.status === "rejected") { actionBtn("Un-reject", "unreject"); }
+  else if (job.status === "applied") { actionBtn("Reject", "reject"); }
 
   if (job.url) {
     if (/^https?:\/\//i.test(job.url)) {
@@ -242,6 +249,7 @@ function render(data) {
     const tr = document.createElement("tr");
     tr.className = "row";
     if (job.status === "rejected") tr.classList.add("rejected");
+    if (job.status === "hold") tr.classList.add("onhold");
 
     const caret = document.createElement("td");
     caret.innerHTML = '<span class="caret">▸</span>';

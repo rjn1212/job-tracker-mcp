@@ -2,7 +2,7 @@
 """Local web viewer for the job-tracker database.
 
 Serves a single-page UI and a JSON API over the jobs table. Reads open the DB
-read-only. One narrow write path -- POST /api/reject -- flips a job's status to
+read-only. One narrow write path -- POST /api/status -- flips a job's status to
 rejected (or back to new) through the app's own update_job. Binds to localhost
 only, and blocks cross-origin POSTs.
 
@@ -14,6 +14,7 @@ import re
 import sqlite3
 import sys
 import threading
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -37,7 +38,7 @@ SORTS = {"date": "date_seen DESC, last_seen DESC",
          "score": "fit_score DESC, date_seen DESC",
          # applied date, most recent first; un-applied (NULL) sink last in DESC
          "applied": "date_applied DESC, date_seen DESC"}
-STATUSES = {"new", "applied", "expired", "rejected"}
+STATUSES = {"new", "applied", "expired", "rejected", "hold"}
 
 FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
           "status", "source", "url", "salary_raw", "date_applied", "date_posted",
@@ -125,17 +126,28 @@ _write_db = None
 _write_lock = threading.Lock()
 
 
-def set_rejected(jid, action):
-    """The one write path: flip a job to rejected (or back to new) via the app's
-    own update_job, so status-transition rules apply. The read-write Database is
-    created lazily and shared (it is thread-safe: check_same_thread=False + lock)."""
+ACTION_STATUS = {"reject": "rejected", "unreject": "new", "hold": "hold"}
+
+
+def apply_action(jid, action):
+    """The one write path: change a job's status via the app's update_job, so
+    transition rules apply. 'unhold' resolves to expired when the posting is
+    already past its validThrough, otherwise back to new. The read-write
+    Database is created lazily and shared (thread-safe: check_same_thread=False
+    + lock)."""
     global _write_db
     with _write_lock:
         if _write_db is None:
             sys.path.insert(0, os.path.dirname(HERE))  # repo root, for job_tracker_mcp
             from job_tracker_mcp.database import Database
             _write_db = Database()
-        status = "rejected" if action == "reject" else "new"
+        if action == "unhold":
+            row = _write_db.conn.execute(
+                "SELECT valid_through FROM jobs WHERE id = ?", (jid,)).fetchone()
+            vt = row["valid_through"] if row else None
+            status = "expired" if (vt and vt < date.today().isoformat()) else "new"
+        else:
+            status = ACTION_STATUS[action]
         return _write_db.update_job(jid, status=status)
 
 
@@ -170,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = urlparse(self.path)
-        if route.path != "/api/reject":
+        if route.path != "/api/status":
             self._send(404, "not found", "text/plain"); return
         # CSRF guard: a cross-site POST from another page carries a foreign
         # Origin; our own page's fetch sends our host (or no Origin at all).
@@ -184,10 +196,10 @@ class Handler(BaseHTTPRequestHandler):
         action = params.get("action", ["reject"])[0]
         if not re.fullmatch(r"[0-9a-f]{16}", jid):
             self._send(400, json.dumps({"error": "bad id"}), "application/json"); return
-        if action not in ("reject", "unreject"):
+        if action not in ("reject", "unreject", "hold", "unhold"):
             self._send(400, json.dumps({"error": "bad action"}), "application/json"); return
         try:
-            self._send(200, json.dumps(set_rejected(jid, action)), "application/json")
+            self._send(200, json.dumps(apply_action(jid, action)), "application/json")
         except Exception as e:  # noqa: BLE001
             self._send(500, json.dumps({"error": str(e)}), "application/json")
 

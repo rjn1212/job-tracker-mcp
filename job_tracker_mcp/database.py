@@ -38,7 +38,7 @@ from job_tracker_mcp.onenote.store import ONENOTE_SCHEMA_SQL
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 MAX_LIMIT = 200
 MAX_BULK = 100
 
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at         TEXT NOT NULL,
 
     CHECK (off_profile IN (0, 1)),
-    CHECK (status IN ('new', 'applied', 'rejected', 'expired')),
+    CHECK (status IN ('new', 'applied', 'rejected', 'expired', 'hold')),
     CHECK (fit_score IS NULL OR (fit_score BETWEEN 1 AND 10)),
     CHECK (times_seen >= 1),
     CHECK (status != 'applied' OR date_applied IS NOT NULL),
@@ -266,7 +266,8 @@ class Database:
                  5: self._rebuild_ids, 6: self._rebuild_ids,
                  7: self._rebuild_ids, 8: self._migrate_8_to_9,
                  9: self._migrate_9_to_10, 10: self._migrate_10_to_11,
-                 11: self._migrate_11_to_12, 12: self._migrate_12_to_13}
+                 11: self._migrate_11_to_12, 12: self._migrate_12_to_13,
+                 13: self._migrate_13_to_14}
         for version in range(frm, to):
             step = steps.get(version)
             if step is None:
@@ -339,6 +340,85 @@ class Database:
         """Posting expiry (validThrough), parsed from the JD page. Additive."""
         if not self._has_column("jobs", "valid_through"):
             self.conn.execute("ALTER TABLE jobs ADD COLUMN valid_through TEXT")
+
+    def _migrate_13_to_14(self) -> None:
+        """Add 'hold' to the status CHECK. SQLite can't alter a CHECK in place,
+        so rebuild the jobs table (the standard 12-step procedure).
+
+        foreign_keys MUST be OFF during the rebuild: onenote_links references
+        jobs(id) ON DELETE CASCADE, and dropping jobs with enforcement on would
+        cascade-delete that evidence. executescript() commits first and runs in
+        autocommit, so the PRAGMA takes effect. Idempotent: skipped once the
+        CHECK already allows 'hold', and DROP IF EXISTS clears a partial run.
+        """
+        sql = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'jobs'").fetchone()[0]
+        if "'hold'" in sql:
+            return
+        cols = ("id, company, company_canonical, title, title_canonical, location, "
+                "location_canonical, url, source, date_seen, last_seen, times_seen, "
+                "date_applied, status, fit_score, notes, email_subject, merged_into, "
+                "created_at, updated_at, off_profile, salary_min, salary_max, "
+                "salary_period, salary_annual_min, salary_annual_max, salary_raw, "
+                "description, description_fetched_at, jd_reviewed_at, date_posted, "
+                "valid_through")
+        self.conn.executescript(f"""
+            PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS jobs_new;
+            CREATE TABLE jobs_new (
+                id                 TEXT PRIMARY KEY,
+                company            TEXT NOT NULL,
+                company_canonical  TEXT NOT NULL,
+                title              TEXT NOT NULL,
+                title_canonical    TEXT NOT NULL,
+                location           TEXT NOT NULL,
+                location_canonical TEXT NOT NULL,
+                url                TEXT,
+                source             TEXT,
+                date_seen          TEXT NOT NULL,
+                last_seen          TEXT NOT NULL,
+                times_seen         INTEGER NOT NULL DEFAULT 1,
+                date_applied       TEXT,
+                status             TEXT NOT NULL DEFAULT 'new',
+                fit_score          INTEGER,
+                notes              TEXT,
+                email_subject      TEXT,
+                merged_into        TEXT REFERENCES jobs(id),
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL,
+                off_profile        INTEGER NOT NULL DEFAULT 0,
+                salary_min         INTEGER,
+                salary_max         INTEGER,
+                salary_period      TEXT,
+                salary_annual_min  INTEGER,
+                salary_annual_max  INTEGER,
+                salary_raw         TEXT,
+                description        TEXT,
+                description_fetched_at TEXT,
+                jd_reviewed_at     TEXT,
+                date_posted        TEXT,
+                valid_through      TEXT,
+                CHECK (off_profile IN (0, 1)),
+                CHECK (status IN ('new', 'applied', 'rejected', 'expired', 'hold')),
+                CHECK (fit_score IS NULL OR (fit_score BETWEEN 1 AND 10)),
+                CHECK (times_seen >= 1),
+                CHECK (status != 'applied' OR date_applied IS NOT NULL),
+                CHECK (length(location_canonical) > 0),
+                CHECK (merged_into IS NULL OR merged_into != id),
+                CHECK (salary_period IS NULL OR salary_period IN ('year', 'hour')),
+                CHECK (salary_min IS NULL OR salary_max IS NULL OR salary_min <= salary_max)
+            );
+            INSERT INTO jobs_new ({cols}) SELECT {cols} FROM jobs;
+            DROP TABLE jobs;
+            ALTER TABLE jobs_new RENAME TO jobs;
+            CREATE INDEX idx_jobs_status    ON jobs(status);
+            CREATE INDEX idx_jobs_company   ON jobs(company_canonical);
+            CREATE INDEX idx_jobs_date_seen ON jobs(date_seen);
+            CREATE INDEX idx_jobs_source    ON jobs(source);
+            CREATE INDEX idx_jobs_merged    ON jobs(merged_into);
+            CREATE INDEX idx_jobs_triage    ON jobs(status, fit_score DESC, date_seen DESC);
+            PRAGMA foreign_keys=ON;
+        """)
 
     def _rebuild_ids(self) -> None:
         """Recompute every id from the current canonicalizers.

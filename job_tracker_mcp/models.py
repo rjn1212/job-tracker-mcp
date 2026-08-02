@@ -18,6 +18,7 @@ class Status(StrEnum):
     APPLIED = "applied"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    HOLD = "hold"
 
 
 class PatternType(StrEnum):
@@ -47,10 +48,14 @@ PROFILE_RULE_TYPES = tuple(p.value for p in ProfileRuleType)
 # Authoritative. update_job and mark_applied are the only consumers.
 # Self-transitions are permitted so that retries are idempotent.
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "new": {"new", "applied", "rejected", "expired"},
+    # 'hold' is reachable only from 'new' (only this set includes it), which
+    # enforces "hold is only for new jobs". From hold you go back to new, or to
+    # expired once past the posting's validThrough.
+    "new": {"new", "applied", "rejected", "expired", "hold"},
     "applied": {"applied", "rejected", "expired"},
     "rejected": {"rejected", "expired", "new"},
     "expired": {"expired", "new", "applied"},
+    "hold": {"hold", "new", "expired"},
 }
 
 
