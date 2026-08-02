@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Local, read-only web viewer for the job-tracker database.
+"""Local web viewer for the job-tracker database.
 
-Serves a single-page UI and a JSON API over the jobs table. Opens the DB
-strictly read-only, so it can run safely alongside the MCP server / Claude
-Desktop writing to the same file. Binds to localhost only.
+Serves a single-page UI and a JSON API over the jobs table. Reads open the DB
+read-only. One narrow write path -- POST /api/reject -- flips a job's status to
+rejected (or back to new) through the app's own update_job. Binds to localhost
+only, and blocks cross-origin POSTs.
 
   PORT=8787 JOB_TRACKER_DB=/path/to/jobs.db python server.py
 """
@@ -11,6 +12,8 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -38,7 +41,7 @@ STATUSES = {"new", "applied", "expired", "rejected"}
 
 FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
           "status", "source", "url", "salary_raw", "date_applied", "date_posted",
-          "description")
+          "valid_through", "description")
 
 
 def connect():
@@ -118,6 +121,24 @@ def query_jobs(qs):
     return {"count": len(jobs), "jobs": jobs}
 
 
+_write_db = None
+_write_lock = threading.Lock()
+
+
+def set_rejected(jid, action):
+    """The one write path: flip a job to rejected (or back to new) via the app's
+    own update_job, so status-transition rules apply. The read-write Database is
+    created lazily and shared (it is thread-safe: check_same_thread=False + lock)."""
+    global _write_db
+    with _write_lock:
+        if _write_db is None:
+            sys.path.insert(0, os.path.dirname(HERE))  # repo root, for job_tracker_mcp
+            from job_tracker_mcp.database import Database
+            _write_db = Database()
+        status = "rejected" if action == "reject" else "new"
+        return _write_db.update_job(jid, status=status)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         payload = body.encode("utf-8") if isinstance(body, str) else body
@@ -146,6 +167,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
         else:
             self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        route = urlparse(self.path)
+        if route.path != "/api/reject":
+            self._send(404, "not found", "text/plain"); return
+        # CSRF guard: a cross-site POST from another page carries a foreign
+        # Origin; our own page's fetch sends our host (or no Origin at all).
+        origin = self.headers.get("Origin")
+        if origin and origin not in (f"http://{HOST}:{PORT}", f"http://localhost:{PORT}"):
+            self._send(403, json.dumps({"error": "cross-origin blocked"}), "application/json")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        params = parse_qs(self.rfile.read(length).decode("utf-8")) if length else {}
+        jid = params.get("id", [""])[0].strip().lower()
+        action = params.get("action", ["reject"])[0]
+        if not re.fullmatch(r"[0-9a-f]{16}", jid):
+            self._send(400, json.dumps({"error": "bad id"}), "application/json"); return
+        if action not in ("reject", "unreject"):
+            self._send(400, json.dumps({"error": "bad action"}), "application/json"); return
+        try:
+            self._send(200, json.dumps(set_rejected(jid, action)), "application/json")
+        except Exception as e:  # noqa: BLE001
+            self._send(500, json.dumps({"error": str(e)}), "application/json")
 
     def log_message(self, *args):
         pass  # quiet
