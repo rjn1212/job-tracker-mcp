@@ -135,10 +135,15 @@ def _clean_direct_location(loc: str) -> str:
 def direct(lines, links, preamble_company=None):
     try:
         start = next(i for i, l in enumerate(lines) if l.strip().lower() == "job matches:") + 1
+        candidates = lines[start:]
     except StopIteration:
-        return []
+        # No "job matches:" marker (e.g. Fitch's talent-community mail). Fall back
+        # to the body lines that are themselves job-posting links -- their anchor
+        # text is "Title - Location", so they carry exactly the postings.
+        link_texts = {l["text"].strip() for l in links}
+        candidates = [l for l in lines if l.strip() in link_texts]
     out = []
-    for l in lines[start:]:
+    for l in candidates:
         if " - " not in l:
             continue
         title, _, loc = l.rpartition(" - ")
