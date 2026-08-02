@@ -8,11 +8,13 @@
   :root {
     --bg: #f6f7f9; --panel: #fff; --line: #e2e5ea; --ink: #1c2024;
     --muted: #6b7280; --accent: #2563eb; --chip: #eef2ff; --hi: #f0f9ff;
+    --applied: #157f3b;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14171c; --panel: #1c2027; --line: #2c313a; --ink: #e6e8eb;
       --muted: #9aa3ad; --accent: #6ea8fe; --chip: #23304a; --hi: #1b2735;
+      --applied: #56c271;
     }
   }
   * { box-sizing: border-box; }
@@ -45,6 +47,9 @@
   td.jid { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); white-space: nowrap; user-select: all; }
   tbody tr.rejected td.role { text-decoration: line-through; color: var(--muted); }
   tbody tr.onhold td.role { font-style: italic; color: var(--muted); }
+  tbody tr.expired td { color: var(--muted); opacity: 0.65; }
+  tbody tr.expired td.role { text-decoration: line-through; }
+  tbody tr.applied td.role { color: var(--applied); font-weight: 700; }
   td.salary { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
          background: var(--chip); color: var(--accent); margin-left: 8px; vertical-align: middle; }
@@ -250,6 +255,8 @@ function render(data) {
     tr.className = "row";
     if (job.status === "rejected") tr.classList.add("rejected");
     if (job.status === "hold") tr.classList.add("onhold");
+    if (job.status === "expired") tr.classList.add("expired");
+    if (job.status === "applied") tr.classList.add("applied");
 
     const caret = document.createElement("td");
     caret.innerHTML = '<span class="caret">▸</span>';
