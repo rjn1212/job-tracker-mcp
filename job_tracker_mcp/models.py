@@ -19,6 +19,7 @@ class Status(StrEnum):
     REJECTED = "rejected"
     EXPIRED = "expired"
     HOLD = "hold"
+    DECLINED = "declined"
 
 
 class PatternType(StrEnum):
@@ -51,11 +52,18 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     # 'hold' is reachable only from 'new' (only this set includes it), which
     # enforces "hold is only for new jobs". From hold you go back to new, or to
     # expired once past the posting's validThrough.
+    #
+    # 'declined' = the EMPLOYER turned you down (distinct from 'rejected', which
+    # is YOU dismissing the posting). It follows an application, so it is reached
+    # from 'applied'; it is also reachable from 'rejected' so the rows the Claude
+    # agent labeled 'rejected'-meaning-declined can be corrected. Un-declining
+    # returns to 'applied' (date_applied is present) or 'new' if it is not.
     "new": {"new", "applied", "rejected", "expired", "hold"},
-    "applied": {"applied", "rejected", "expired"},
-    "rejected": {"rejected", "expired", "new"},
+    "applied": {"applied", "rejected", "expired", "declined"},
+    "rejected": {"rejected", "expired", "new", "declined"},
     "expired": {"expired", "new", "applied"},
     "hold": {"hold", "new", "expired"},
+    "declined": {"declined", "applied", "new"},
 }
 
 

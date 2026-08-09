@@ -227,7 +227,10 @@ def get_jobs(
 ) -> dict:
     """List jobs, best fit first, then most recently seen. Unscored jobs sort last.
 
-    status        -- new | applied | rejected | expired
+    status        -- new | applied | rejected | expired | hold | declined
+                     rejected = YOU dismissed the posting;
+                     declined = the EMPLOYER turned you down after you applied;
+                     hold     = parked for later (only a 'new' job can be held).
     min_fit_score -- excludes unscored jobs, which cannot meet a threshold
     limit         -- clamped to 200
     include_off_profile -- by default, NEW jobs that match no profile rule are
@@ -278,9 +281,15 @@ def update_job(
     `notes` REPLACES existing notes entirely (this is the correction tool).
     Contrast mark_applied, whose `notes` APPENDS.
 
+    Status values: new | applied | rejected | expired | hold | declined.
+      rejected = YOU dismissed the posting; declined = the EMPLOYER turned you
+      down after you applied; hold = parked for later.
     Status transitions: an applied job can never return to "new". A rejected or
     expired job CAN be reopened to "new". Use status="expired" for a role that
     was filled or withdrawn -- there is no separate mark_expired tool.
+    "declined" is reachable from "applied" (the normal path) or from "rejected"
+    (to correct a row that was wrongly filed as rejected when the employer
+    actually declined you). "hold" is reachable only from "new".
 
     Reopening a job does not remove any rejection pattern that auto-rejected
     it; the next add_job for that company would auto-reject again. Use

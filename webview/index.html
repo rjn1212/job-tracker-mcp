@@ -8,13 +8,13 @@
   :root {
     --bg: #f6f7f9; --panel: #fff; --line: #e2e5ea; --ink: #1c2024;
     --muted: #6b7280; --accent: #2563eb; --chip: #eef2ff; --hi: #f0f9ff;
-    --applied: #157f3b;
+    --applied: #157f3b; --declined: #b3261e;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14171c; --panel: #1c2027; --line: #2c313a; --ink: #e6e8eb;
       --muted: #9aa3ad; --accent: #6ea8fe; --chip: #23304a; --hi: #1b2735;
-      --applied: #56c271;
+      --applied: #56c271; --declined: #f2837a;
     }
   }
   * { box-sizing: border-box; }
@@ -50,6 +50,7 @@
   tbody tr.expired td { color: var(--muted); opacity: 0.65; }
   tbody tr.expired td.role { text-decoration: line-through; }
   tbody tr.applied td.role { color: var(--applied); font-weight: 700; }
+  tbody tr.declined td.role { text-decoration: line-through; color: var(--declined); }
   td.salary { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
          background: var(--chip); color: var(--accent); margin-left: 8px; vertical-align: middle; }
@@ -92,6 +93,7 @@
         <option value="expired">expired</option>
         <option value="rejected">rejected</option>
         <option value="hold">hold</option>
+        <option value="declined">declined</option>
       </select>
     </label>
     <label>Applied?
@@ -219,8 +221,9 @@ function detailRow(job) {
   }
   if (job.status === "new") { actionBtn("Hold", "hold"); actionBtn("Reject", "reject"); }
   else if (job.status === "hold") { actionBtn("Un-hold", "unhold"); }
-  else if (job.status === "rejected") { actionBtn("Un-reject", "unreject"); }
-  else if (job.status === "applied") { actionBtn("Reject", "reject"); }
+  else if (job.status === "rejected") { actionBtn("Un-reject", "unreject"); actionBtn("Declined", "decline"); }
+  else if (job.status === "applied") { actionBtn("Declined", "decline"); actionBtn("Reject", "reject"); }
+  else if (job.status === "declined") { actionBtn("Un-decline", "undecline"); }
 
   if (job.url) {
     if (/^https?:\/\//i.test(job.url)) {
@@ -257,6 +260,7 @@ function render(data) {
     if (job.status === "hold") tr.classList.add("onhold");
     if (job.status === "expired") tr.classList.add("expired");
     if (job.status === "applied") tr.classList.add("applied");
+    if (job.status === "declined") tr.classList.add("declined");
 
     const caret = document.createElement("td");
     caret.innerHTML = '<span class="caret">▸</span>';

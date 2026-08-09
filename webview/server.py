@@ -38,7 +38,7 @@ SORTS = {"date": "date_seen DESC, last_seen DESC",
          "score": "fit_score DESC, date_seen DESC",
          # applied date, most recent first; un-applied (NULL) sink last in DESC
          "applied": "date_applied DESC, date_seen DESC"}
-STATUSES = {"new", "applied", "expired", "rejected", "hold"}
+STATUSES = {"new", "applied", "expired", "rejected", "hold", "declined"}
 
 FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
           "status", "source", "url", "salary_raw", "date_applied", "date_posted",
@@ -126,15 +126,17 @@ _write_db = None
 _write_lock = threading.Lock()
 
 
-ACTION_STATUS = {"reject": "rejected", "unreject": "new", "hold": "hold"}
+ACTION_STATUS = {"reject": "rejected", "unreject": "new", "hold": "hold",
+                 "decline": "declined"}
 
 
 def apply_action(jid, action):
     """The one write path: change a job's status via the app's update_job, so
     transition rules apply. 'unhold' resolves to expired when the posting is
-    already past its validThrough, otherwise back to new. The read-write
-    Database is created lazily and shared (thread-safe: check_same_thread=False
-    + lock)."""
+    already past its validThrough, otherwise back to new. 'undecline' returns to
+    'applied' when date_applied is present (the durable signal) else 'new'. The
+    read-write Database is created lazily and shared (thread-safe:
+    check_same_thread=False + lock)."""
     global _write_db
     with _write_lock:
         if _write_db is None:
@@ -146,6 +148,10 @@ def apply_action(jid, action):
                 "SELECT valid_through FROM jobs WHERE id = ?", (jid,)).fetchone()
             vt = row["valid_through"] if row else None
             status = "expired" if (vt and vt < date.today().isoformat()) else "new"
+        elif action == "undecline":
+            row = _write_db.conn.execute(
+                "SELECT date_applied FROM jobs WHERE id = ?", (jid,)).fetchone()
+            status = "applied" if (row and row["date_applied"]) else "new"
         else:
             status = ACTION_STATUS[action]
         return _write_db.update_job(jid, status=status)
@@ -196,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
         action = params.get("action", ["reject"])[0]
         if not re.fullmatch(r"[0-9a-f]{16}", jid):
             self._send(400, json.dumps({"error": "bad id"}), "application/json"); return
-        if action not in ("reject", "unreject", "hold", "unhold"):
+        if action not in ("reject", "unreject", "hold", "unhold", "decline", "undecline"):
             self._send(400, json.dumps({"error": "bad action"}), "application/json"); return
         try:
             self._send(200, json.dumps(apply_action(jid, action)), "application/json")
