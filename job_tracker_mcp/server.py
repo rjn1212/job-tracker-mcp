@@ -284,9 +284,13 @@ def update_job(
     Status values: new | applied | rejected | expired | hold | declined.
       rejected = YOU dismissed the posting; declined = the EMPLOYER turned you
       down after you applied; hold = parked for later.
-    Status transitions: an applied job can never return to "new". A rejected or
+    Status transitions: applying is durable. Once a job is "applied" its only
+    outward states are "applied" (still waiting) or "declined" (employer said
+    no) -- it can NOT be reopened to "new", nor marked "expired"/"rejected",
+    because your having applied outranks the posting's own status. A rejected or
     expired job CAN be reopened to "new". Use status="expired" for a role that
-    was filled or withdrawn -- there is no separate mark_expired tool.
+    was filled or withdrawn (only for jobs you did NOT apply to) -- there is no
+    separate mark_expired tool.
     "declined" is reachable from "applied" (the normal path) or from "rejected"
     (to correct a row that was wrongly filed as rejected when the employer
     actually declined you). "hold" is reachable only from "new".

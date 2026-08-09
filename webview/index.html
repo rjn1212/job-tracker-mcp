@@ -222,7 +222,7 @@ function detailRow(job) {
   if (job.status === "new") { actionBtn("Hold", "hold"); actionBtn("Reject", "reject"); }
   else if (job.status === "hold") { actionBtn("Un-hold", "unhold"); }
   else if (job.status === "rejected") { actionBtn("Un-reject", "unreject"); actionBtn("Declined", "decline"); }
-  else if (job.status === "applied") { actionBtn("Declined", "decline"); actionBtn("Reject", "reject"); }
+  else if (job.status === "applied") { actionBtn("Declined", "decline"); }
   else if (job.status === "declined") { actionBtn("Un-decline", "undecline"); }
 
   if (job.url) {

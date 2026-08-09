@@ -58,8 +58,13 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     # from 'applied'; it is also reachable from 'rejected' so the rows the Claude
     # agent labeled 'rejected'-meaning-declined can be corrected. Un-declining
     # returns to 'applied' (date_applied is present) or 'new' if it is not.
+    #
+    # Applying is durable: once a job is 'applied', its only outward states are
+    # 'applied' (still waiting) or 'declined' (employer said no). It must NOT
+    # fall to 'expired' just because the posting later lapsed, nor to 'rejected'
+    # -- your having applied is the fact that matters, not the posting's status.
     "new": {"new", "applied", "rejected", "expired", "hold"},
-    "applied": {"applied", "rejected", "expired", "declined"},
+    "applied": {"applied", "declined"},
     "rejected": {"rejected", "expired", "new", "declined"},
     "expired": {"expired", "new", "applied"},
     "hold": {"hold", "new", "expired"},
