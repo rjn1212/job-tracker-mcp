@@ -31,6 +31,58 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 
 from job_tracker_mcp.database import Database
 import extract_postings as ep
+import ill_joblink as ilj
+
+# IllinoisJobLink (AJLA) alerts carry no employer or salary -- each posting is
+# enriched from its own page before adding. This source is noisy (a state job
+# bank, lots of junior/IC roles), so ingest filters it: only senior+ titles, and
+# only pay at/above a floor (undisclosed pay is kept -- unknown is not "low").
+# Both are env-overridable: AJLA_SALARY_FLOOR (default 150000; 0 disables) and
+# AJLA_TIER ("senior" default, or "all" to keep every level).
+AJLA_FLOOR = int(os.environ.get("AJLA_SALARY_FLOOR", "150000"))
+AJLA_TIER = os.environ.get("AJLA_TIER", "senior").lower()
+_AJLA_SENIOR = re.compile(r"\b(senior|sr\.?|lead|principal|staff|manager|mgr|"
+                          r"director|head of|architect|vp|vice president|chief|distinguished)\b", re.I)
+_AJLA_JUNIOR = re.compile(r"\b(entry[ -]?level|intern|internship|junior|jr\.?|co-?op|"
+                          r"apprentice|associate (?!director|principal)|graduate|"
+                          r"developer i\b|engineer i\b|analyst i\b)\b", re.I)
+
+
+def enrich_ajla(db, postings):
+    """Fetch each IllinoisJobLink posting for company/salary/JD, drop expired,
+    off-tier, and below-floor rows, and skip ids already tracked. Returns
+    (kept_postings, stats)."""
+    stats = dict(expired=0, off_tier=0, low_salary=0, already=0, enriched=0)
+    kept = []
+    client = ilj.httpx.Client(headers=ilj.UA, follow_redirects=True, timeout=25)
+    try:
+        for p in postings:
+            url = p["url"]
+            if db.conn.execute("SELECT 1 FROM jobs WHERE url = ? LIMIT 1", (url,)).fetchone():
+                stats["already"] += 1
+                continue
+            d = ilj.fetch(url, client)
+            if d.get("status") != "OK":
+                stats["expired"] += 1
+                continue
+            title = d.get("title") or p.get("title") or ""
+            if AJLA_TIER == "senior" and _AJLA_JUNIOR.search(title) and not _AJLA_SENIOR.search(title):
+                stats["off_tier"] += 1
+                continue
+            amax = d.get("annual_max")
+            if AJLA_FLOOR and amax is not None and amax < AJLA_FLOOR:
+                stats["low_salary"] += 1
+                continue
+            p.update(company=d.get("company") or "IllinoisJobLink (employer not stated)",
+                     title=title, location=d.get("location") or "Illinois",
+                     salary=d.get("salary_raw"),
+                     description=(d.get("description") if len(d.get("description") or "") >= 120 else None),
+                     valid_through=d.get("valid_through"))
+            stats["enriched"] += 1
+            kept.append(p)
+    finally:
+        client.close()
+    return kept, stats
 
 # get_message_links' own job_links_only filter recognizes only LinkedIn/Indeed/
 # awstrack URLs and drops company careers links (e.g. jobs.grainger.com/job/...),
@@ -138,13 +190,19 @@ def main():
     tot = dict(created=0, duplicates=0, auto_rejected=0, off_profile=0, errors=0)
     for msg in msgs:
         postings, board = postings_for(mail, msg)
+        extra = ""
+        if board == "illinoisjoblink" and postings:
+            postings, st = enrich_ajla(db, postings)   # fetch pages, tier/salary filter
+            extra = (f"  [ajla: +{st['enriched']} kept; skip {st['off_tier']} tier, "
+                     f"{st['low_salary']} <${AJLA_FLOOR//1000}k, {st['expired']} expired, "
+                     f"{st['already']} known]")
         seen += len(postings)
         if not newest or msg["date_received"] > newest:
             newest = msg["date_received"]
         miss = sum(1 for p in postings if not p.get("url"))
         flag = f"  ({miss} MISSING url)" if miss else ""
         print(f'  {msg["date_received"][:10]}  {board:8} {len(postings):2}  '
-              f'{msg["subject"][:56]}{flag}')
+              f'{msg["subject"][:56]}{flag}{extra}')
         if not args.dry_run and postings:
             res = db.bulk_add_jobs(postings)
             for k in tot:

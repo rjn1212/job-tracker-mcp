@@ -39,6 +39,8 @@ def board_of(sender: str) -> str:
         return "builtin"
     if "oracle" in s:
         return "oracle"
+    if "ajla" in s or "joblink" in s:
+        return "illinoisjoblink"
     return "direct"
 
 
@@ -152,7 +154,34 @@ def direct(lines, links, preamble_company=None):
     return out
 
 
-PARSERS = dict(linkedin=linkedin, indeed=indeed, builtin=builtin, oracle=oracle)
+# IllinoisJobLink (AJLA, notifications@ajla.net): the body is a run-on table
+# "Title | Posting ID | City" with one tracked link per row. The posting IDs are
+# the only reliable field in the email; the employer and salary live on the
+# posting page (see scripts/ill_joblink.py), so ingest ENRICHES each id before
+# adding -- the parser just yields the canonical URL keyed by posting id.
+AJLA_ID = re.compile(r"\|\s*(\d{6,})\s*\|")
+AJLA_URL = "https://illinoisjoblink.illinois.gov/jobs/{}"
+
+
+def illinoisjoblink(lines, links):
+    body = "\n".join(lines)
+    out, seen = [], set()
+    for m in AJLA_ID.finditer(body):
+        jid = m.group(1)
+        if jid in seen:
+            continue
+        seen.add(jid)
+        # best-effort title = the run-on text before this id, minus a leading
+        # city carried over from the prior row; authoritative title comes from
+        # enrichment, so a rough value is fine (and unused once enriched).
+        pre = body[:m.start()].rpartition("|")[2].strip()
+        out.append(dict(company="", title=pre[-80:].strip(), location="",
+                        salary=None, url=AJLA_URL.format(jid), posting_id=jid))
+    return out
+
+
+PARSERS = dict(linkedin=linkedin, indeed=indeed, builtin=builtin, oracle=oracle,
+               illinoisjoblink=illinoisjoblink)
 
 
 def company_from_preamble(lines):
