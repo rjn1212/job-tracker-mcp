@@ -51,7 +51,8 @@
   tbody tr.expired td.role { text-decoration: line-through; }
   tbody tr.applied td.role { color: var(--applied); font-weight: 700; }
   tbody tr.declined td.role { text-decoration: line-through; color: var(--declined); }
-  td.salary { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.salary { white-space: nowrap; font-variant-numeric: tabular-nums;
+              max-width: 14em; overflow: hidden; text-overflow: ellipsis; }
   .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
          background: var(--chip); color: var(--accent); margin-left: 8px; vertical-align: middle; }
   .detail td { background: var(--hi); border-bottom: 1px solid var(--line); }
@@ -280,6 +281,7 @@ function render(data) {
     const salary = document.createElement("td");
     salary.className = "salary";
     salary.textContent = cleanSalary(job.salary_raw) || "—";
+    salary.title = job.salary_raw || "";   // full text on hover if truncated
 
     const seen = document.createElement("td");
     seen.className = "seen";
