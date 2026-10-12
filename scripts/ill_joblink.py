@@ -117,7 +117,10 @@ def fetch(url: str, client: httpx.Client | None = None) -> dict:
     own = client is None
     client = client or httpx.Client(headers=UA, follow_redirects=True, timeout=25)
     try:
-        r = client.get(url)
+        try:
+            r = client.get(url)
+        except httpx.HTTPError as e:                  # timeouts/resets are transient, not "expired"
+            return {"status": f"FAILED:{type(e).__name__}", "url": url}
         if r.status_code == 401 or "job is not active" in r.text.lower():
             return {"status": "EXPIRED", "url": url}
         if r.status_code != 200:

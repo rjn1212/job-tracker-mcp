@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +42,7 @@ import ill_joblink as ilj
 # AJLA_TIER ("senior" default, or "all" to keep every level).
 AJLA_FLOOR = int(os.environ.get("AJLA_SALARY_FLOOR", "150000"))
 AJLA_TIER = os.environ.get("AJLA_TIER", "senior").lower()
+AJLA_PACE = float(os.environ.get("AJLA_PACE", "1.0"))   # seconds between page fetches
 _AJLA_SENIOR = re.compile(r"\b(senior|sr\.?|lead|principal|staff|manager|mgr|"
                           r"director|head of|architect|vp|vice president|chief|distinguished)\b", re.I)
 _AJLA_JUNIOR = re.compile(r"\b(entry[ -]?level|intern|internship|junior|jr\.?|co-?op|"
@@ -52,8 +54,8 @@ def enrich_ajla(db, postings):
     """Fetch each IllinoisJobLink posting for company/salary/JD, drop expired,
     off-tier, and below-floor rows, and skip ids already tracked. Returns
     (kept_postings, stats)."""
-    stats = dict(expired=0, off_tier=0, low_salary=0, already=0, enriched=0)
-    kept = []
+    stats = dict(expired=0, failed=0, off_tier=0, low_salary=0, already=0, enriched=0)
+    kept, failed_urls = [], []
     client = ilj.httpx.Client(headers=ilj.UA, follow_redirects=True, timeout=25)
     try:
         for p in postings:
@@ -61,9 +63,21 @@ def enrich_ajla(db, postings):
             if db.conn.execute("SELECT 1 FROM jobs WHERE url = ? LIMIT 1", (url,)).fetchone():
                 stats["already"] += 1
                 continue
-            d = ilj.fetch(url, client)
-            if d.get("status") != "OK":
+            # IllinoisJobLink throttles bursts (HTTP 429). Pace every request and
+            # retry transient failures with backoff; only a real 401 / "job is not
+            # active" page counts as expired. (A 2026-10-12 burst of ~200 fetches
+            # was silently dropped as "expired" before this.)
+            for wait in (0, 5, 15, 45):
+                time.sleep(wait or AJLA_PACE)
+                d = ilj.fetch(url, client)
+                if d.get("status") in ("OK", "EXPIRED"):
+                    break
+            if d.get("status") == "EXPIRED":
                 stats["expired"] += 1
+                continue
+            if d.get("status") != "OK":
+                stats["failed"] += 1
+                failed_urls.append(f"{url} ({d.get('status')})")
                 continue
             title = d.get("title") or p.get("title") or ""
             if AJLA_TIER == "senior" and _AJLA_JUNIOR.search(title) and not _AJLA_SENIOR.search(title):
@@ -82,6 +96,8 @@ def enrich_ajla(db, postings):
             kept.append(p)
     finally:
         client.close()
+    for f in failed_urls:
+        print(f"    ajla FAILED (not added; retry with --since): {f}")
     return kept, stats
 
 # get_message_links' own job_links_only filter recognizes only LinkedIn/Indeed/
@@ -194,7 +210,7 @@ def main():
         if board == "illinoisjoblink" and postings:
             postings, st = enrich_ajla(db, postings)   # fetch pages, tier/salary filter
             extra = (f"  [ajla: +{st['enriched']} kept; skip {st['off_tier']} tier, "
-                     f"{st['low_salary']} <${AJLA_FLOOR//1000}k, {st['expired']} expired, "
+                     f"{st['low_salary']} <${AJLA_FLOOR//1000}k, {st['expired']} expired, {st['failed']} FAILED, "
                      f"{st['already']} known]")
         seen += len(postings)
         if not newest or msg["date_received"] > newest:
