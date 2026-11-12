@@ -251,6 +251,15 @@ _LEGAL_SUFFIXES = frozenset({
     "sa", "nv", "bv", "ab", "ag", "as", "oy", "pty", "pbc", "srl", "kk",
 })
 
+# Map variant canonical names to a single canonical form.  Applied AFTER
+# suffix-stripping and lowercasing, so keys must be lowercase and suffix-free.
+_COMPANY_ALIASES: dict[str, str] = {
+    "grainger businesses": "grainger",
+    "grainger business": "grainger",
+    "w.w. grainger": "grainger",
+    "grainger management": "grainger",
+}
+
 
 def canonicalize_company(value: str | None) -> str:
     """Strip a leading "The" and trailing legal-entity suffixes.
@@ -265,7 +274,8 @@ def canonicalize_company(value: str | None) -> str:
     if len(tokens) > 1 and tokens[0] == "the":
         tokens.pop(0)
     # A company legitimately named e.g. "Limited" must not normalize to "".
-    return " ".join(tokens) or normalize_key_part(value)
+    result = " ".join(tokens) or normalize_key_part(value)
+    return _COMPANY_ALIASES.get(result, result)
 
 
 # A segment is dropped only when it is unambiguously not part of the role name.
