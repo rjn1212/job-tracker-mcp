@@ -40,9 +40,9 @@ SORTS = {"date": "date_seen DESC, last_seen DESC",
          "applied": "date_applied DESC, date_seen DESC"}
 STATUSES = {"new", "applied", "expired", "rejected", "hold", "declined"}
 
-FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
-          "status", "source", "url", "salary_raw", "date_applied", "date_posted",
-          "valid_through", "description")
+LIST_FIELDS = ("id", "title", "company", "date_seen", "last_seen", "fit_score",
+               "status", "source", "url", "salary_raw", "date_applied", "date_posted",
+               "valid_through", "description IS NOT NULL AS has_desc")
 
 
 def connect():
@@ -71,7 +71,7 @@ def _int(qs, key, default=0):
 def query_jobs(qs):
     since = qs.get("since", [""])[0].strip()
     min_score = _int(qs, "min_score", 0)
-    min_desc_len = _int(qs, "min_desc_len", 0)
+    has_desc = qs.get("has_desc", [""])[0].strip().lower()
     status = qs.get("status", [""])[0].strip().lower()
     applied = qs.get("applied", [""])[0].strip().lower()
     jobid = qs.get("jobid", [""])[0].strip().lower()
@@ -84,8 +84,10 @@ def query_jobs(qs):
         where.append("date_seen >= ?"); params.append(since)
     if min_score > 0:
         where.append("fit_score >= ?"); params.append(min_score)
-    if min_desc_len > 0:
-        where.append("COALESCE(LENGTH(description), 0) >= ?"); params.append(min_desc_len)
+    if has_desc == "yes":
+        where.append("description IS NOT NULL")
+    elif has_desc == "no":
+        where.append("description IS NULL")
     if status in STATUSES:
         where.append("status = ?"); params.append(status)
     # "applied" = has a date_applied (the durable signal; survives a later
@@ -102,7 +104,7 @@ def query_jobs(qs):
         where.append("instr(lower(company), ?) > 0"); params.append(company)
 
     order = SORTS.get(sort, SORTS["date"])
-    sql = (f"SELECT {', '.join(FIELDS)} FROM jobs "
+    sql = (f"SELECT {', '.join(LIST_FIELDS)} FROM jobs "
            f"WHERE {' AND '.join(where)} ORDER BY {order} LIMIT {MAX_ROWS}")
 
     conn = connect()
@@ -112,14 +114,21 @@ def query_jobs(qs):
     finally:
         conn.close()
 
-    jobs = []
-    for r in rows:
-        d = dict(r)
-        desc = d.pop("description")
-        d["desc_len"] = len(desc) if desc else 0
-        d["description"] = desc or ""
-        jobs.append(d)
+    jobs = [dict(r) for r in rows]
     return {"count": len(jobs), "jobs": jobs}
+
+
+def get_job_detail(jid):
+    conn = connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT description, notes FROM jobs WHERE id = ?", (jid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {"description": row["description"] or "", "notes": row["notes"] or ""}
 
 
 _write_db = None
@@ -183,6 +192,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(data), "application/json")
             except Exception as e:  # noqa: BLE001 -- report, don't crash the server
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif route.path.startswith("/api/job/"):
+            jid = route.path[len("/api/job/"):].strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{16}", jid):
+                self._send(400, json.dumps({"error": "bad id"}), "application/json")
+            else:
+                detail = get_job_detail(jid)
+                if detail is None:
+                    self._send(404, json.dumps({"error": "not found"}), "application/json")
+                else:
+                    self._send(200, json.dumps(detail), "application/json")
         else:
             self._send(404, "not found", "text/plain")
 

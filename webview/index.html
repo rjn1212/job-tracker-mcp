@@ -83,8 +83,12 @@
     <label>Min JD score
       <input type="number" id="min_score" min="0" max="10" step="1" placeholder="0">
     </label>
-    <label>Min description length (chars)
-      <input type="number" id="min_desc_len" min="0" step="100" placeholder="0">
+    <label>Has JD?
+      <select id="has_desc">
+        <option value="">any</option>
+        <option value="yes">yes</option>
+        <option value="no">no</option>
+      </select>
     </label>
     <label>Status
       <select id="status">
@@ -130,7 +134,7 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const controls = ["company", "jobid", "since", "min_score", "min_desc_len", "status", "applied", "sort"];
+const controls = ["company", "jobid", "since", "min_score", "has_desc", "status", "applied", "sort"];
 const rowsEl = $("rows"), emptyEl = $("empty"), countEl = $("count");
 
 // Drop the redundant annual period ("a year" / "/ year" / "per year") for
@@ -145,6 +149,16 @@ function fmtSalary(j) { return cleanSalary(j.salary_raw); }
 function flash(btn, msg) {
   btn.textContent = msg;
   setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+}
+
+async function loadDetail(job) {
+  if (job._detail) return;
+  try {
+    const res = await fetch("/api/job/" + encodeURIComponent(job.id));
+    job._detail = await res.json();
+  } catch {
+    job._detail = {description: "(failed to load)", notes: ""};
+  }
 }
 
 async function copyToClipboard(text) {
@@ -178,7 +192,7 @@ function detailRow(job) {
   if (job.source) bits.push("source: " + job.source);
   if (fmtSalary(job)) bits.push("salary: " + fmtSalary(job));
   if (job.last_seen) bits.push("last seen: " + job.last_seen);
-  bits.push("description: " + job.desc_len + " chars");
+  bits.push("description: " + (job.has_desc ? "yes" : "none"));
   meta.textContent = bits.join("   ·   ");
   td.appendChild(meta);
 
@@ -191,10 +205,11 @@ function detailRow(job) {
   const copyBtn = document.createElement("button");
   copyBtn.textContent = "Copy";
   copyBtn.title = "Copy “Company - Role” then the description";
-  copyBtn.addEventListener("click", (e) => {
+  copyBtn.addEventListener("click", async (e) => {
     e.stopPropagation();
+    if (!job._detail) await loadDetail(job);
     const text = (job.company || "") + " - " + (job.title || "") +
-                 "\n\n" + (job.description || "");
+                 "\n\n" + (job._detail?.description || "");
     copyToClipboard(text).then(
       () => flash(copyBtn, "Copied!"),
       () => flash(copyBtn, "Copy failed"));
@@ -242,7 +257,14 @@ function detailRow(job) {
 
   const desc = document.createElement("div");
   desc.className = "desc";
-  desc.textContent = job.description ? job.description : "(no description on file)";
+  if (job._detail) {
+    desc.textContent = job._detail.description || "(no description on file)";
+  } else {
+    desc.textContent = "Loading…";
+    loadDetail(job).then(() => {
+      desc.textContent = job._detail.description || "(no description on file)";
+    });
+  }
   td.appendChild(desc);
 
   tr.appendChild(td);
@@ -301,7 +323,7 @@ function render(data) {
 
     const dlen = document.createElement("td");
     dlen.className = "dlen";
-    dlen.textContent = job.desc_len ? job.desc_len.toLocaleString() : "—";
+    dlen.textContent = job.has_desc ? "✓" : "—";
 
     const idcell = document.createElement("td");
     idcell.className = "jid";
